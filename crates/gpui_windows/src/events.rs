@@ -378,14 +378,10 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    /// CDXC:PlatformSupport 2026-10-11 WHY:
+    /// Windows sends `WM_MOUSEMOVE` at the unchanged pointer position without the mouse moving (while the user types, for example), and each one restored the cursor GPUI hides on typing and switched the window back to mouse input, which re-hovers everything under the pointer until the next keystroke hides it again; hovering a chat message and typing made its hover background, actions and time blink on every key. A move at the same client position with the same pressed button is not reported again.
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
         self.start_tracking_mouse(handle, TME_LEAVE);
-        self.restore_cursor_after_hide();
-
-        let Some(mut func) = self.state.callbacks.input.take() else {
-            return Some(1);
-        };
-        let scale_factor = self.state.scale_factor.get();
 
         let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
             flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
@@ -399,6 +395,16 @@ impl WindowsWindowInner {
             }
             _ => None,
         };
+        let mouse_move = Some((lparam.0, pressed_button));
+        if self.state.last_mouse_move.replace(mouse_move) == mouse_move {
+            return Some(0);
+        }
+        self.restore_cursor_after_hide();
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+        let scale_factor = self.state.scale_factor.get();
         let x = lparam.signed_loword() as f32;
         let y = lparam.signed_hiword() as f32;
         let input = PlatformInput::MouseMove(MouseMoveEvent {
@@ -417,6 +423,7 @@ impl WindowsWindowInner {
     /// The window hover flag only redraws; element hover listeners need MouseExited to clear their delayed highlight.
     fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
+        self.state.last_mouse_move.set(None);
         self.restore_cursor_after_hide();
         if let Some(mut callback) = self.state.callbacks.hovered_status_change.take() {
             callback(false);

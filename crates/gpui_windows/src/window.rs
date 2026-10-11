@@ -106,6 +106,9 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    /// The client position (`WM_MOUSEMOVE` lparam) and pressed button of the last mouse move
+    /// GPUI was told about; cleared when the pointer leaves the window.
+    pub last_mouse_move: Cell<Option<(isize, Option<MouseButton>)>>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
 
@@ -223,6 +226,7 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            last_mouse_move: Cell::new(None),
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
