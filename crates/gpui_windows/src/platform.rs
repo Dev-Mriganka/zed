@@ -1027,6 +1027,16 @@ impl Platform for WindowsPlatform {
         read_from_clipboard()
     }
 
+    /// Reads on a background thread. `GetClipboardData` on a format the
+    /// source app renders on demand (Office pictures, Remote Desktop,
+    /// screenshot tools) waits for that app to render it, up to the system's
+    /// 30 second timeout when the app is busy or hung, and doing that on the
+    /// UI thread froze every window until it returned.
+    fn read_from_clipboard_async(&self) -> Task<Result<Option<ClipboardItem>, ClipboardReadError>> {
+        self.background_executor
+            .spawn(async { Ok(read_from_clipboard()) })
+    }
+
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
         // CredWriteW rejects larger blobs with the opaque RPC error
         // 0x800706F7 "The stub received bad data", so fail with a clear
