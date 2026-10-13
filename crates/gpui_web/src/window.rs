@@ -256,7 +256,12 @@ impl WebWindow {
             holds_page_keyboard: takes_focus,
             visibility: document_visibility(&browser_window),
             is_hovered: false,
-            mouse_position: Point::default(),
+            // CDXC:WebGpui 2026-10-13 WHY: GPUI hit-tests a new window's first frame at this position, and an overlay opens without the pointer having entered it. (0, 0) is its top-left corner, so a just-opened popup (the app modals' corner close button) read as hovered until the pointer crossed it. The page window gets a real position from its first pointer event.
+            mouse_position: if is_overlay {
+                Point::new(px(-1.), px(-1.))
+            } else {
+                Point::default()
+            },
             modifiers: Modifiers::default(),
             capslock: Capslock::default(),
         };
