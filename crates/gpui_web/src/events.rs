@@ -528,11 +528,22 @@ impl WebWindowInner {
         }
         self.ime_mirror.focus();
         self.suppress_focus_status_events.set(false);
+        self.schedule_active_status_refresh();
+    }
 
+    /// Tells GPUI about a focus change after the current task instead of from inside the DOM
+    /// event. A text input's focus and blur fire synchronously from `focus()`, `blur()` and
+    /// element removal, which GPUI itself triggers mid-update (a dialog's first frame focusing
+    /// its input blurs the page's, a dropped dialog hands the keyboard back), and an
+    /// active-status callback run there cannot borrow the app and is lost.
+    pub(crate) fn schedule_active_status_refresh(self: &Rc<Self>) {
+        // Weak: a window closed meanwhile (its input blurs as it leaves the page) is not reported.
         let callback = wasm_bindgen::closure::Closure::once_into_js({
-            let this = Rc::clone(self);
+            let this = Rc::downgrade(self);
             move || {
-                this.refresh_active_status();
+                if let Some(this) = this.upgrade() {
+                    this.refresh_active_status();
+                }
             }
         });
         if let Err(error) = self
@@ -1215,7 +1226,7 @@ impl WebWindowInner {
                 return;
             }
             this.state.borrow_mut().holds_page_keyboard = true;
-            this.refresh_active_status();
+            this.schedule_active_status_refresh();
         })
     }
 
@@ -1246,7 +1257,7 @@ impl WebWindowInner {
                 return;
             }
             this.state.borrow_mut().holds_page_keyboard = false;
-            this.refresh_active_status();
+            this.schedule_active_status_refresh();
         })
     }
 
