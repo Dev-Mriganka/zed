@@ -4535,6 +4535,8 @@ unsafe extern "C" {
 /// reading through as noise.
 const BLURRED_VIEW_BLUR_RADIUS: f64 = 60.0;
 
+/// CDXC:Theming 2026-10-15 WHY:
+/// Core Animation commits a backdrop filter's radius only when the layer gets a new filter: changing the radius of the filter already on screen and setting the same filters again left the old blur showing, so the Blur and Menu blur sliders did nothing to an open window. A changed radius therefore goes on a copy of the filter.
 unsafe fn remove_layer_background(layer: id, blur_radius: f64, keep_saturation: bool) {
     unsafe {
         let _: () = msg_send![layer, setBackgroundColor:nil];
@@ -4555,13 +4557,28 @@ unsafe fn remove_layer_background(layer: id, blur_radius: f64, keep_saturation: 
                 let description: id = msg_send![filter, description];
                 let hit: BOOL = msg_send![description, containsString: blur_string];
                 if hit == YES {
-                    let radius: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
-                    let _: () =
-                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
-                    let _: () = msg_send![layer, setFilters: filters];
+                    let radius_key = ns_string("inputRadius");
+                    let current: id = msg_send![filter, valueForKey: radius_key];
+                    let current: f64 = if current.is_null() {
+                        f64::NAN
+                    } else {
+                        msg_send![current, doubleValue]
+                    };
+                    if current != blur_radius {
+                        let radius: id = msg_send![class!(NSNumber), numberWithDouble: blur_radius];
+                        let copy: id = msg_send![filter, copy];
+                        let _: () = msg_send![copy, setValue: radius forKey: radius_key];
+                        let replaced: id = msg_send![filters, mutableCopy];
+                        let _: () = msg_send![replaced, replaceObjectAtIndex: i withObject: copy];
+                        let _: () = msg_send![layer, setFilters: replaced];
+                        let _: () = msg_send![copy, release];
+                        let _: () = msg_send![replaced, release];
+                    }
                     break;
                 }
             }
+            // Read them again: the blur above may have replaced the array.
+            let filters: id = msg_send![layer, filters];
             // Remove the increased saturation.
             // The effect of a `CAFilter` or `CIFilter` is determined by its name, and the
             // `description` reflects its name and some parameters. Currently `NSVisualEffectView`
