@@ -95,6 +95,7 @@ impl WindowsWindowInner {
             // So, let's eagerly activate the window.
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => self.handle_activate_msg(wparam),
+            WM_NCACTIVATE => self.handle_nc_activate_msg(handle, wparam, lparam),
             WM_CREATE => self.handle_create_msg(handle),
             WM_WINDOWPOSCHANGED => {
                 // Ghostex: a frosted surface's blur windows follow it (`frosted_backdrop.rs`).
@@ -857,6 +858,21 @@ impl WindowsWindowInner {
             }
             Some(result.0 as isize)
         }
+    }
+
+    /// Ghostex: a window on the system acrylic keeps its frame drawn as active when it loses
+    /// focus, so DWM keeps blurring behind it instead of filling it with flat grey
+    /// (`keeps_system_backdrop_when_inactive`). Focus, `WM_ACTIVATE` and the taskbar are unchanged.
+    fn handle_nc_activate_msg(
+        &self,
+        handle: HWND,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if wparam.0 != 0 || !keeps_system_backdrop_when_inactive(&self.state) {
+            return None;
+        }
+        Some(unsafe { DefWindowProcW(handle, WM_NCACTIVATE, WPARAM(1), lparam) }.0)
     }
 
     fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {

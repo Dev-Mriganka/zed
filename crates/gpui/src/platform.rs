@@ -1209,6 +1209,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// custom image and video on every platform), and whether the live blur keeps the colour
     /// saturation the platform material adds (the main window's glass strips it).
     fn set_background_blur_style(&self, _radius: Pixels, _keep_saturation: bool) {}
+    /// Ghostex: which blur a blurred background uses where the system draws it (Windows).
+    fn set_background_behind_window_blur(&self, _blur: BehindWindowBlur) {}
     /// Limits a blurred background to these rounded rectangles, in window coordinates, for a
     /// window whose content is several separate cards; an empty list blurs the whole window.
     fn set_background_blur_region(&self, _region: Vec<(Bounds<Pixels>, Pixels)>) {}
@@ -2823,6 +2825,19 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// Ghostex: how a [`WindowBackgroundAppearance::Blurred`] window blurs the windows and desktop
+/// behind it where the system draws that blur and has no radius to set (Windows).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BehindWindowBlur {
+    /// The system's own blur material (the acrylic on Windows 11), which adds its own frost.
+    #[default]
+    System,
+    /// The same blur without the material's frost, so what is behind keeps its colours.
+    Plain,
+    /// No blur: what is behind shows sharp through the window's own tint.
+    Off,
 }
 
 /// The text rendering mode to use for drawing glyphs.

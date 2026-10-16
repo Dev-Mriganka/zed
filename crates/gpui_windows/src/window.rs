@@ -95,6 +95,8 @@ pub struct WindowsWindowState {
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
+    /// Ghostex: how a blurred window blurs what is behind it (`set_whole_window_blur`).
+    pub(crate) behind_window_blur: Cell<BehindWindowBlur>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
@@ -215,6 +217,7 @@ impl WindowsWindowState {
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            behind_window_blur: Cell::new(BehindWindowBlur::System),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -1014,7 +1017,7 @@ impl PlatformWindow for WindowsWindow {
                 {
                     clear_window_blur(hwnd);
                 } else {
-                    set_whole_window_blur(hwnd);
+                    set_whole_window_blur(hwnd, self.state.behind_window_blur.get());
                 }
             }
             WindowBackgroundAppearance::MicaBackdrop => {
@@ -1066,6 +1069,16 @@ impl PlatformWindow for WindowsWindow {
         });
     }
 
+    // Ghostex: the blur behind a blurred window, which DWM draws with no radius to set: its system
+    // acrylic, the older acrylic accent without the system acrylic's frost, or none.
+    fn set_background_behind_window_blur(&self, blur: BehindWindowBlur) {
+        if self.state.behind_window_blur.replace(blur) != blur
+            && self.state.background_appearance.get() == WindowBackgroundAppearance::Blurred
+        {
+            self.set_background_appearance(WindowBackgroundAppearance::Blurred);
+        }
+    }
+
     // Ghostex: a frosted surface keeps its blur, and everything it draws, inside the rounded rects
     // it reports each frame (a tooltip host is exactly its bubble, a toast stack its cards). DWM
     // draws a window's acrylic over its whole rectangle whatever its region, so the blur moves to
@@ -1083,7 +1096,7 @@ impl PlatformWindow for WindowsWindow {
             if backdrops {
                 clear_window_blur(hwnd);
             } else {
-                set_whole_window_blur(hwnd);
+                set_whole_window_blur(hwnd, self.state.behind_window_blur.get());
             }
         } else {
             self.state
@@ -1821,13 +1834,44 @@ fn retrieve_window_placement(
 /// where Windows has it, else with the legacy acrylic accent. The legacy accent made Windows
 /// recompose the window's blur slowly on every frame it drew: a 4K window at 240 Hz drew a
 /// sidebar slide at ~25 ms a frame with it, ~10 ms opaque or over a drawn wallpaper.
-fn set_whole_window_blur(hwnd: HWND) {
-    if system_backdrop_available() {
-        set_window_composition_attribute(hwnd, None, 0);
-        dwm_set_window_composition_attribute(hwnd, 3);
-    } else {
-        set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+///
+/// `BehindWindowBlur::Plain` asks for that legacy accent anyway: the same blur without the system
+/// acrylic's grey frost, so the app's own tint is the only layer over it. `Off` leaves the window
+/// clear (the transparent-gradient accent), which costs no blur at all.
+///
+/// CDXC:Theming 2026-10-16 WHY:
+/// DWM gives a window's behind-window blur no radius on any Windows version: the system backdrops
+/// (Mica, Mica Alt, Acrylic) and the accents (ACCENT_ENABLE_BLURBEHIND, ACCENT_ENABLE_ACRYLICBLURBEHIND)
+/// each draw one fixed blur, and on Windows 11 the blur-behind accent draws the acrylic accent's
+/// blur. Drawing a radius ourselves would need the screen behind the window captured with the
+/// window left out, which only WDA_EXCLUDEFROMCAPTURE allows, and that hides Ghostex from every
+/// screenshot and screen share.
+fn set_whole_window_blur(hwnd: HWND, blur: BehindWindowBlur) {
+    match blur {
+        BehindWindowBlur::System if system_backdrop_available() => {
+            set_window_composition_attribute(hwnd, None, 0);
+            dwm_set_window_composition_attribute(hwnd, 3);
+        }
+        BehindWindowBlur::System | BehindWindowBlur::Plain => {
+            dwm_set_window_composition_attribute(hwnd, 1);
+            set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+        }
+        BehindWindowBlur::Off => clear_window_blur(hwnd),
     }
+}
+
+/// Ghostex: whether the window lies to DWM that it is still active when it loses focus
+/// (`handle_nc_activate_msg`).
+///
+/// CDXC:Theming 2026-10-16 WHY:
+/// DWM paints the system acrylic of an inactive window as a flat grey fill, so with Desktop and
+/// windows the glass went solid grey whenever another app had focus and no tint setting changed
+/// it. A window blurred by the system acrylic therefore keeps its frame drawn as active; the
+/// legacy accents keep their blur while inactive on their own.
+pub(crate) fn keeps_system_backdrop_when_inactive(state: &WindowsWindowState) -> bool {
+    state.background_appearance.get() == WindowBackgroundAppearance::Blurred
+        && state.behind_window_blur.get() == BehindWindowBlur::System
+        && system_backdrop_available()
 }
 
 /// Ghostex: no blur of the window's own: a frosted surface whose rounded blur windows draw its

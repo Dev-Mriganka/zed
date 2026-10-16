@@ -3112,6 +3112,12 @@ impl Window {
             .set_background_blur_style(radius, keep_saturation);
     }
 
+    /// Ghostex: which blur a blurred window background uses where the system draws the blur of the
+    /// windows behind it and has no radius to set (Windows). Other platforms ignore it.
+    pub fn set_background_behind_window_blur(&self, blur: crate::BehindWindowBlur) {
+        self.platform_window.set_background_behind_window_blur(blur);
+    }
+
     /// Limits a blurred window background to these rounded rectangles, in window coordinates, so a
     /// window holding several separate cards blurs only behind them. An empty list blurs the whole
     /// window again.
