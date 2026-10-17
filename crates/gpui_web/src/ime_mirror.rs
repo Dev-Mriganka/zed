@@ -47,8 +47,18 @@ const CONTEXT_CHARS: usize = 512;
 /// element write and therefore an IME restart.
 const MIN_EDGE_CHARS: usize = 64;
 
-/// The attribute on each window's hidden element.
+/// The attribute on each window's hidden element; its value is the window's id.
 pub(crate) const WINDOW_INPUT_ATTRIBUTE: &str = "data-gpui-window-input";
+
+/// The id of the window whose hidden element has the page's focus: the window that holds the
+/// keyboard, as the key window does on the desktop platforms.
+pub(crate) fn focused_window_input(document: &web_sys::Document) -> Option<u64> {
+    document
+        .active_element()?
+        .get_attribute(WINDOW_INPUT_ATTRIBUTE)?
+        .parse()
+        .ok()
+}
 
 /// Focuses the hidden element of the window opened last, which is the one on top: an overlay
 /// window that closes hands the keyboard back to the window under it.
@@ -214,6 +224,13 @@ impl ImeMirror {
 
     pub(crate) fn focus(&self) {
         Self::focus_element(&self.element);
+    }
+
+    /// Names the window this element belongs to (`focused_window_input`).
+    pub(crate) fn tag_window(&self, window_id: u64) {
+        self.element
+            .set_attribute(WINDOW_INPUT_ATTRIBUTE, &window_id.to_string())
+            .ok();
     }
 
     fn focus_element(element: &web_sys::HtmlTextAreaElement) {

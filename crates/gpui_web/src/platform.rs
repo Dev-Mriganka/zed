@@ -427,8 +427,22 @@ impl Platform for WebPlatform {
         Some(self.active_display.clone())
     }
 
+    /// The window holding the page's keyboard, else the one opened last. Reporting the last one
+    /// regardless kept an overlay popup "active" after a click on the page window under it took
+    /// the keyboard, so a popup that closes on click-away (Ghostex's chat model menu) stayed open.
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        self.open_windows.borrow().last().copied()
+        let open_windows = self.open_windows.borrow();
+        self.browser_window
+            .document()
+            .as_ref()
+            .and_then(crate::ime_mirror::focused_window_input)
+            .and_then(|id| {
+                open_windows
+                    .iter()
+                    .find(|handle| handle.window_id().as_u64() == id)
+                    .copied()
+            })
+            .or_else(|| open_windows.last().copied())
     }
 
     fn open_window(

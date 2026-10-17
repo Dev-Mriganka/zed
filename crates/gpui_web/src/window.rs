@@ -226,6 +226,7 @@ impl WebWindow {
         // An overlay takes the keyboard once it is open (below), not while the
         // platform is still opening it.
         let ime_mirror = ImeMirror::new(&document, &body, touch_input, takes_focus && !is_overlay)?;
+        ime_mirror.tag_window(handle.window_id().as_u64());
         let mut viewport = WebViewport::new(&document)?;
         viewport.update(&browser_window, &canvas)?;
 
