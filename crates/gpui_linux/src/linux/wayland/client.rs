@@ -2112,10 +2112,16 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                                 }
 
                                 xkb::Status::Composed => {
-                                    state.pre_edit_text.take();
+                                    let had_pre_edit = state.pre_edit_text.take().is_some();
                                     keystroke.key_char = compose.utf8();
                                     if let Some(keysym) = compose.keysym() {
                                         keystroke.key = xkb::keysym_get_name(keysym);
+                                    }
+                                    // CDXC:PlatformSupport 2026-10-18 WHY: the dead key opened a preedit with SetMarkedText, and the composed character arrives as a plain KeyDown. A view that encodes keys itself (Ghostex's terminal) treats every key as part of a composition while marked text is set and dropped all input until focus loss cleared it (GitHub issue #256, dead keys on Fedora KDE). Close the preedit first, the way the focus-leave path does.
+                                    if had_pre_edit {
+                                        drop(state);
+                                        focused_window.handle_ime(ImeInput::DeleteText);
+                                        state = client.borrow_mut();
                                     }
                                 }
                                 xkb::Status::Cancelled => {
@@ -2237,6 +2243,8 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
                     // IBus Intercepts keys like `a`, `b`, but those keys are needed for vim mode.
                     // We should only send ASCII characters to Zed, otherwise a user could remap a letter like `か` or `相`.
                     if commit_text.len() == 1 {
+                        // The commit replaces the shown preedit; drop it before the synthetic KeyDown so a terminal does not swallow that key as part of the composition (see the compose path above).
+                        window.handle_ime(ImeInput::DeleteText);
                         window.handle_input(PlatformInput::KeyDown(KeyDownEvent {
                             keystroke: Keystroke {
                                 modifiers: Modifiers::default(),

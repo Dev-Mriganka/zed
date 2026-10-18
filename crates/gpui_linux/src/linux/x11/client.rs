@@ -1191,10 +1191,16 @@ impl X11Client {
                         compose_state.feed(keysym);
                         match compose_state.status() {
                             xkbc::Status::Composed => {
-                                state.pre_edit_text.take();
+                                let had_pre_edit = state.pre_edit_text.take().is_some();
                                 keystroke.key_char = compose_state.utf8();
                                 if let Some(keysym) = compose_state.keysym() {
                                     keystroke.key = xkbc::keysym_get_name(keysym);
+                                }
+                                // CDXC:PlatformSupport 2026-10-18 SEE-ALSO: the Wayland compose path in wayland/client.rs closes the dead key's preedit before the composed KeyDown for the same reason (GitHub issue #256).
+                                if had_pre_edit {
+                                    drop(state);
+                                    window.handle_ime_delete();
+                                    state = self.0.borrow_mut();
                                 }
                             }
                             xkbc::Status::Composing => {
