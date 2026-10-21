@@ -684,9 +684,30 @@ impl rwh::HasDisplayHandle for WindowsWindow {
     }
 }
 
+/// Ghostex: before an active owned window hides, activation moves to its nearest visible owner.
+/// Windows otherwise hands it to the next window in z-order, which is often another app's: closing
+/// or reopening a menu pop-up brought that app in front of Ghostex. Only an active window hands
+/// anything over, so a pop-up closed by a click elsewhere leaves activation where the click put it.
+fn hand_activation_to_owner(hwnd: HWND) {
+    unsafe {
+        if GetActiveWindow() != hwnd {
+            return;
+        }
+        let mut owner = GetWindow(hwnd, GW_OWNER).ok();
+        while let Some(candidate) = owner.filter(|owner| !owner.is_invalid()) {
+            if IsWindowVisible(candidate).as_bool() && !IsIconic(candidate).as_bool() {
+                SetActiveWindow(candidate).log_err();
+                return;
+            }
+            owner = GetWindow(candidate, GW_OWNER).ok();
+        }
+    }
+}
+
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
         self.0.dialog_owner.close();
+        hand_activation_to_owner(self.0.hwnd);
         unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
         // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
         // resulting visibility report has nothing to notify.
