@@ -617,13 +617,23 @@ impl DirectWriteState {
                 break_ligatures = !break_ligatures;
             }
 
-            let mut runs = Vec::new();
+            // CoreText and cosmic-text take a line's base direction from its first strong
+            // character, which decides where neutrals and embedded runs go; DirectWrite
+            // starts every paragraph left-to-right unless told otherwise. A right-to-left
+            // paragraph needs a finite width, or its leading (right) edge sits at infinity.
+            if unicode_bidi::get_base_direction(text) == unicode_bidi::Direction::Rtl {
+                text_layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                text_layout.GetMetrics(&mut metrics)?;
+                text_layout.SetMaxWidth(metrics.widthIncludingTrailingWhitespace.max(1.0))?;
+                text_layout.SetReadingDirection(DWRITE_READING_DIRECTION_RIGHT_TO_LEFT)?;
+            }
+
             let mut renderer_context = RendererContext {
                 text_system: self,
                 components,
                 index_converter: StringIndexConverter::new(text),
-                runs: &mut runs,
-                width: 0.0,
+                runs: Vec::new(),
             };
             text_layout.Draw(
                 Some((&raw mut renderer_context).cast::<c_void>().cast_const()),
@@ -631,7 +641,25 @@ impl DirectWriteState {
                 0.0,
                 0.0,
             )?;
-            let width = px(renderer_context.width);
+
+            // `Draw` reports runs in its own order with snapped origins. Lay them out
+            // left to right by their visual position, abutting, so each run lands where
+            // the bidi algorithm put it.
+            let mut positioned_runs = renderer_context.runs;
+            positioned_runs.sort_by(|a, b| a.left_edge.total_cmp(&b.left_edge));
+            let mut runs = Vec::with_capacity(positioned_runs.len());
+            let mut width = 0.0f32;
+            for mut positioned_run in positioned_runs {
+                for glyph in &mut positioned_run.glyphs {
+                    glyph.position.x += px(width);
+                }
+                width += positioned_run.advance;
+                runs.push(ShapedRun {
+                    font_id: positioned_run.font_id,
+                    glyphs: positioned_run.glyphs,
+                });
+            }
+            let width = px(width);
 
             Ok(LineLayout {
                 font_size,
@@ -1401,12 +1429,20 @@ impl TextRenderer {
     }
 }
 
-struct RendererContext<'t, 'a, 'b> {
+struct RendererContext<'t, 'a> {
     text_system: &'t mut DirectWriteState,
     components: &'a DirectWriteComponents,
     index_converter: StringIndexConverter<'a>,
-    runs: &'b mut Vec<ShapedRun>,
-    width: f32,
+    runs: Vec<PositionedRun>,
+}
+
+/// A glyph run from `DrawGlyphRun`, its glyphs positioned from the run's own left edge.
+struct PositionedRun {
+    font_id: FontId,
+    glyphs: Vec<ShapedGlyph>,
+    /// Where `Draw` put the run's left edge, used only to order the runs visually.
+    left_edge: f32,
+    advance: f32,
 }
 
 #[derive(Debug)]
@@ -1505,7 +1541,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
     fn DrawGlyphRun(
         &self,
         clientdrawingcontext: *const ::core::ffi::c_void,
-        _baselineoriginx: f32,
+        baselineoriginx: f32,
         _baselineoriginy: f32,
         _measuringmode: DWRITE_MEASURING_MODE,
         glyphrun: *const DWRITE_GLYPH_RUN,
@@ -1590,12 +1626,19 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             )?
         };
 
+        // An odd bidi level is a right-to-left run: DirectWrite hands over its glyphs in
+        // logical order and lays them out leftwards from the baseline origin, which is the
+        // run's right edge, with positive advance offsets pointing left. The glyphs stay
+        // in logical order with falling x, as cosmic-text gives them on Linux and the web.
+        let right_to_left = glyphrun.bidiLevel % 2 == 1;
+        let run_advance: f32 = glyph_advances.iter().sum();
         let cluster_analyzer = ClusterAnalyzer::new(cluster_map, glyph_count);
         let mut utf16_idx = desc.textPosition as usize;
         let mut glyph_idx = 0;
+        let mut pen = 0.0f32;
         let mut glyphs = Vec::with_capacity(glyph_count);
         for (cluster_utf16_len, cluster_glyph_count) in cluster_analyzer {
-            context.index_converter.advance_to_utf16_ix(utf16_idx);
+            context.index_converter.seek_to_utf16_ix(utf16_idx);
             utf16_idx += cluster_utf16_len;
             for (cluster_glyph_idx, glyph_id) in glyph_ids
                 [glyph_idx..(glyph_idx + cluster_glyph_count)]
@@ -1606,20 +1649,35 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                 let is_emoji =
                     color_font && is_color_glyph(font_face, id, &context.components.factory);
                 let this_glyph_idx = glyph_idx + cluster_glyph_idx;
+                let advance_offset = glyph_offsets[this_glyph_idx].advanceOffset;
+                let x = if right_to_left {
+                    pen += glyph_advances[this_glyph_idx];
+                    run_advance - pen - advance_offset
+                } else {
+                    let x = pen + advance_offset;
+                    pen += glyph_advances[this_glyph_idx];
+                    x
+                };
                 glyphs.push(ShapedGlyph {
                     id,
-                    position: point(
-                        px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
-                        px(-glyph_offsets[this_glyph_idx].ascenderOffset),
-                    ),
+                    position: point(px(x), px(-glyph_offsets[this_glyph_idx].ascenderOffset)),
                     index: context.index_converter.utf8_ix,
                     is_emoji,
                 });
-                context.width += glyph_advances[this_glyph_idx];
             }
             glyph_idx += cluster_glyph_count;
         }
-        context.runs.push(ShapedRun { font_id, glyphs });
+        let left_edge = if right_to_left {
+            baselineoriginx - run_advance
+        } else {
+            baselineoriginx
+        };
+        context.runs.push(PositionedRun {
+            font_id,
+            glyphs,
+            left_edge,
+            advance: run_advance,
+        });
         Ok(())
     }
 
@@ -1716,6 +1774,16 @@ impl<'a> StringIndexConverter<'a> {
             self.utf16_ix += c.len_utf16();
         }
         self.utf8_ix = self.text.len();
+    }
+
+    /// Runs arrive in visual order, so a right-to-left run can start before the
+    /// previous run's text; seeking backwards restarts from the beginning.
+    fn seek_to_utf16_ix(&mut self, utf16_target: usize) {
+        if utf16_target < self.utf16_ix {
+            self.utf8_ix = 0;
+            self.utf16_ix = 0;
+        }
+        self.advance_to_utf16_ix(utf16_target);
     }
 
     fn advance_to_utf16_ix(&mut self, utf16_target: usize) {

@@ -522,6 +522,15 @@ impl LineWrapper {
         // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
         matches!(c, '\u{0980}'..='\u{09FF}') ||
 
+        // Right-to-left scripts: Hebrew, Arabic (with Persian and Urdu letters), Syriac,
+        // Thaana and their presentation forms, so an Arabic word is not split mid-word.
+        matches!(c, '\u{0590}'..='\u{07BF}') ||
+        matches!(c, '\u{0860}'..='\u{08FF}') ||
+        matches!(c, '\u{FB1D}'..='\u{FDFF}') ||
+        matches!(c, '\u{FE70}'..='\u{FEFF}') ||
+        // Zero-width (non-)joiners sit inside Persian and Arabic words.
+        matches!(c, '\u{200C}' | '\u{200D}') ||
+
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
