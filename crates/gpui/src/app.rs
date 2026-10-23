@@ -2881,6 +2881,16 @@ impl App {
         self.loading_assets.remove(&asset_id);
     }
 
+    /// Ghostex: removes an asset from GPUI's cache and hands back what it had loaded, so a
+    /// decoded image can be taken out of the windows' atlases too.
+    pub(crate) fn take_asset<A: Asset>(&mut self, source: &A::Source) -> Option<A::Output> {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        self.loading_assets
+            .remove(&asset_id)?
+            .downcast_ref::<CachedLoad<A::Output>>()?
+            .get()
+    }
+
     /// Check whether an asset is present in GPUI's cache (loading or loaded),
     /// without fetching it.
     #[cfg(any(test, feature = "test-support"))]
