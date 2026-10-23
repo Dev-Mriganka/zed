@@ -3531,6 +3531,9 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
             lock.start_display_link();
         } else {
             lock.stop_display_link();
+            // Ghostex: a window nobody can see keeps no window-sized path textures; the next
+            // frame that draws a path allocates them again.
+            lock.renderer.release_window_path_textures();
         }
     }
     drop(lock);

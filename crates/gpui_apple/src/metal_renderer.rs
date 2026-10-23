@@ -463,12 +463,37 @@ impl MetalRenderer {
         }
     }
 
+    /// Ghostex: the path textures are not reallocated here. A live resize calls this for every
+    /// frame and most frames draw no path, so the textures are dropped and the next frame that
+    /// draws a path allocates them at its own size (`ensure_window_path_textures`).
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        self.update_path_intermediate_textures(size);
+        self.release_window_path_textures();
         crate::fast::layers::TileCache::clear(&mut self.fast_layers);
+    }
+
+    /// Ghostex: frees the window-sized path textures (about 4 bytes per drawable pixel, ~28 MB
+    /// for a full-screen Retina window) until a frame draws a path again. Called when the window
+    /// is resized and when it stops being visible (minimized, hidden, on another Space, covered).
+    pub fn release_window_path_textures(&mut self) {
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
+    }
+
+    /// Ghostex: allocates the window's path textures at `size` unless they already have it.
+    /// Called by a frame that draws paths, before it rasterizes them.
+    pub(crate) fn ensure_window_path_textures(&mut self, size: Size<DevicePixels>) {
+        let current = self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            });
+        if !current {
+            self.update_path_intermediate_textures(size);
+        }
     }
 
     /// The window-sized textures paths drawn straight into the window, or

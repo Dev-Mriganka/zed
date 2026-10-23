@@ -64,6 +64,7 @@ pub(crate) fn draw_primitives_to_texture(
     if scene.paths.is_empty() {
         return Ok(None);
     }
+    renderer.ensure_window_path_textures(viewport_size);
     let path_batches = plan_paths(scene);
     let vertices = write_vertices(scene, &path_batches, writer)?;
 
