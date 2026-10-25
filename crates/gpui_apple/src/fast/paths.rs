@@ -22,7 +22,7 @@
 use std::{mem, ops::Range};
 
 use anyhow::{Context as _, Result};
-use gpui::{Bounds, DevicePixels, PrimitiveBatch, ScaledPixels, Scene, Size};
+use gpui::{Bounds, DevicePixels, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size};
 
 use crate::metal_renderer::{
     InstanceBinding, InstanceBindings, InstanceBufferWriter, MetalRenderer,
@@ -111,7 +111,22 @@ pub(crate) fn draw_primitives_to_texture(
     // The textures `rasterize_group` draws into, which the paths are copied from.
     let path_textures = renderer.window_path_textures();
 
-    for batch in scene.batches() {
+    for batch in scene.scene_batches() {
+        let batch = match batch {
+            SceneBatch::Primitives(batch) => batch,
+            SceneBatch::Effect(effect_index) => {
+                command_encoder = renderer.encode_effect(
+                    scene,
+                    effect_index,
+                    writer,
+                    command_buffer,
+                    texture,
+                    viewport_size,
+                    command_encoder,
+                )?;
+                continue;
+            }
+        };
         match batch {
             PrimitiveBatch::Shadows(range) => {
                 renderer.draw_shadows(range, instance_bindings, viewport_size, command_encoder)

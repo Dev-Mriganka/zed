@@ -4,7 +4,7 @@
 //! not allocate textures or encode mask render passes.
 
 use anyhow::{Context as _, Result};
-use gpui::{AtlasTextureId, DevicePixels, LayerFrame, PrimitiveBatch, Scene, Size};
+use gpui::{AtlasTextureId, DevicePixels, LayerFrame, PrimitiveBatch, Scene, SceneBatch, Size};
 
 use crate::metal_renderer::{
     InstanceBindings, InstanceBufferWriter, MetalRenderer, new_command_encoder_for_texture,
@@ -157,7 +157,22 @@ fn encode<'a>(
     mut encoder: &'a metal::RenderCommandEncoderRef,
 ) -> Result<&'a metal::RenderCommandEncoderRef> {
     renderer.fast_layers.note_composited(scene);
-    for batch in scene.batches() {
+    for batch in scene.scene_batches() {
+        let batch = match batch {
+            SceneBatch::Primitives(batch) => batch,
+            SceneBatch::Effect(effect_index) => {
+                encoder = renderer.encode_effect(
+                    scene,
+                    effect_index,
+                    writer,
+                    commands,
+                    texture,
+                    viewport,
+                    encoder,
+                )?;
+                continue;
+            }
+        };
         bind(encoder, clips, &renderer.device);
         match batch {
             PrimitiveBatch::Shadows(range) => {

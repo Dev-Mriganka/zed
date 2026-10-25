@@ -868,33 +868,15 @@ impl MetalRenderer {
             let batch = match batch {
                 SceneBatch::Primitives(batch) => batch,
                 SceneBatch::Effect(effect_index) => {
-                    // The effect renders into its own textures, so the pass on
-                    // `texture` is closed and reopened (loading its contents)
-                    // around it, the same way paths are drawn.
-                    command_encoder.end_encoding();
-                    let effect = scene.effects.get(effect_index);
-                    let output = match effect {
-                        Some(effect) => self.render_effect(effect, writer, command_buffer)?,
-                        None => None,
-                    };
-                    command_encoder = new_command_encoder_for_texture(
+                    command_encoder = self.encode_effect(
+                        scene,
+                        effect_index,
+                        writer,
                         command_buffer,
                         texture,
                         viewport_size,
-                        None,
-                    );
-                    if let (Some(effect), Some(output)) = (effect, output) {
-                        if let Err(error) = self.composite_effect(
-                            effect,
-                            &output,
-                            writer,
-                            viewport_size,
-                            command_encoder,
-                        ) {
-                            command_encoder.end_encoding();
-                            return Err(error);
-                        }
-                    }
+                        command_encoder,
+                    )?;
                     continue;
                 }
             };
@@ -1461,6 +1443,43 @@ impl MetalRenderer {
     /// Renders the effect's captured scene into its offscreen texture, runs
     /// the shader passes over it, and returns the texture holding the result.
     /// Must be called with no render encoder open on `command_buffer`.
+    /// Draws the scene's effect at `effect_index` into `texture`. The effect renders into its own
+    /// textures, so the pass on `texture` (`command_encoder`) is closed and a new one, loading its
+    /// contents, is returned with the effect composited, the same way paths are drawn.
+    ///
+    /// Ghostex: every renderer a frame can take draws its effects through this (`encode_scene`,
+    /// and GPUI Fast's path and rounded-clip renderers, `fast::paths` and `fast::rounded_clip`).
+    /// The GPUI Fast ones walked only the primitive batches, so a frame with a path or a rounded
+    /// clip dropped every effect, which left a terminal with a custom shader blank.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_effect<'a>(
+        &mut self,
+        scene: &Scene,
+        effect_index: usize,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &'a metal::CommandBufferRef,
+        texture: &'a metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &'a metal::RenderCommandEncoderRef,
+    ) -> Result<&'a metal::RenderCommandEncoderRef> {
+        command_encoder.end_encoding();
+        let effect = scene.effects.get(effect_index);
+        let output = match effect {
+            Some(effect) => self.render_effect(effect, writer, command_buffer)?,
+            None => None,
+        };
+        let command_encoder =
+            new_command_encoder_for_texture(command_buffer, texture, viewport_size, None);
+        if let (Some(effect), Some(output)) = (effect, output)
+            && let Err(error) =
+                self.composite_effect(effect, &output, writer, viewport_size, command_encoder)
+        {
+            command_encoder.end_encoding();
+            return Err(error);
+        }
+        Ok(command_encoder)
+    }
+
     fn render_effect(
         &mut self,
         effect: &PaintEffect,
