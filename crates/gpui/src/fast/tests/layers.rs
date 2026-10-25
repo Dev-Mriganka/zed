@@ -1774,7 +1774,7 @@ mod invalidation {
     use crate::{
         AnyWindowHandle, App, AppContext as _, Context, Entity, GlobalElementId,
         InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollDelta,
-        ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
+        ScrollHandle, ScrollEvent, StatefulInteractiveElement as _, Styled as _,
         TestAppContext, TouchPhase, Window, div, point, px, rgb,
     };
     use std::{cell::Cell, rc::Rc};
@@ -1853,7 +1853,7 @@ mod invalidation {
     ) -> Vec<GlobalElementId> {
         with_window(cx, window, |window, cx| {
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                crate::PlatformInput::Scroll(ScrollEvent {
                     position: point(px(20.), px(20.)),
                     delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                     modifiers: Default::default(),
@@ -2074,7 +2074,7 @@ mod decisions {
     use crate::{
         AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity,
         GlobalElementId, Hsla, InteractiveElement as _, IntoElement, MouseMoveEvent,
-        ParentElement as _, Pixels, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+        ParentElement as _, Pixels, Render, ScrollDelta, ScrollHandle, ScrollEvent,
         StatefulInteractiveElement as _, Styled as _, TestAppContext, TouchPhase, Window,
         WindowHandle, canvas, div, point, px, rgb, size,
     };
@@ -2269,7 +2269,7 @@ mod decisions {
             with_window(cx, window, |window, cx| {
                 change(cx);
                 window.dispatch_event(
-                    crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    crate::PlatformInput::Scroll(ScrollEvent {
                         position: point(px(20.), px(20.)),
                         delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
@@ -2439,7 +2439,7 @@ mod decisions {
         frame_after(cx, window, |cx| {
             with_window(cx, window, |window, cx| {
                 window.dispatch_event(
-                    crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    crate::PlatformInput::Scroll(ScrollEvent {
                         position: point(px(20.), px(20.)),
                         delta: ScrollDelta::Pixels(point(px(0.), px(-20.))),
                         modifiers: Default::default(),
@@ -3197,7 +3197,7 @@ mod input {
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, FocusHandle,
         HitboxBehavior, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
-        ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _,
+        ScrollDelta, ScrollHandle, ScrollEvent, StatefulInteractiveElement as _, Styled as _,
         TestAppContext, TouchPhase, Window, WindowHandle, canvas, div, point, px, rgb,
     };
     use std::{
@@ -3340,7 +3340,7 @@ mod input {
         frame_after(cx, window, |cx| {
             with_window(cx, window, |window, cx| {
                 window.dispatch_event(
-                    crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    crate::PlatformInput::Scroll(ScrollEvent {
                         position: point(px(150.), px(20.)),
                         delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
@@ -4097,7 +4097,7 @@ mod integration {
             for window in [layered, plain] {
                 cx.update_window(window.into(), |_, window, cx| {
                     window.dispatch_event(
-                        crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                        crate::PlatformInput::Scroll(crate::ScrollEvent {
                             position: point(px(20.), px(20.)),
                             delta: crate::ScrollDelta::Pixels(point(px(0.), px(dy))),
                             modifiers: Default::default(),

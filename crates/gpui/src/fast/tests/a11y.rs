@@ -427,7 +427,7 @@ fn scroll_page_frames(cx: &mut TestAppContext, placed: bool) -> u64 {
             cx.update_window(window.into(), |_, window, cx| {
                 let before = window.layout_stats();
                 window.dispatch_event(
-                    crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                    crate::PlatformInput::Scroll(crate::ScrollEvent {
                         position: crate::point(px(20.), px(20.)),
                         delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(dy))),
                         modifiers: Default::default(),

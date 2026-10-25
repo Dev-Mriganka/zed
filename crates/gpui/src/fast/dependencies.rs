@@ -1072,7 +1072,7 @@ impl crate::StateInner {
         follow_state: crate::FollowState,
         pending: bool,
     ) {
-        let moved = scroll_top.moves_from(self.logical_scroll_top, pending);
+        let moved = scroll_top.moves_from(self.fast_anchor_position(), pending);
         self.version
             .bump_if(moved || self.follow_state != follow_state);
     }
@@ -1106,7 +1106,7 @@ impl ListScrollStart {
     /// waiting to be applied read from `state`.
     #[inline(always)]
     pub(crate) fn note_scrolled(self, state: &crate::StateInner, scroll_top: &ListOffset) {
-        state.note_scrolled_to(scroll_top, self.0, state.pending_scroll.is_some());
+        state.note_scrolled_to(scroll_top, self.0, state.fast_scroll_pending());
     }
 }
 

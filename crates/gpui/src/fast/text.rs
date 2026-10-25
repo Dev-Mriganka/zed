@@ -1077,12 +1077,16 @@ thread_local! {
         const { std::cell::RefCell::new(SmallVec::new_const()) };
 }
 
-/// Resolves `font` as [`TextSystem::resolve_font`] does, remembering the few
-/// fonts resolved lately: every run of every line shaped asks for its font,
-/// and looking it up hashes the font and takes a lock each time, where a
-/// frame's text uses a handful of fonts.
+/// Resolves `font` with `resolve`, upstream's [`TextSystem::resolve_font`],
+/// remembering the few fonts resolved lately: every run of every line shaped
+/// asks for its font, and looking it up in the text system hashes the font
+/// and takes a lock each time, where a frame's text uses a handful of fonts.
 #[inline]
-pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
+pub(crate) fn remembered_font(
+    text_system: &crate::TextSystem,
+    font: &crate::Font,
+    resolve: impl FnOnce() -> crate::FontId,
+) -> crate::FontId {
     let generation = FONTS_GENERATION.load(Ordering::Relaxed);
     let platform = &text_system.platform_text_system;
     let remembered = RESOLVED.with_borrow(|resolved| {
@@ -1097,7 +1101,7 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
     if let Some(font_id) = remembered {
         return font_id;
     }
-    let font_id = resolve_font_uncached(text_system, font);
+    let font_id = resolve();
     RESOLVED.with_borrow_mut(|resolved| {
         if resolved.len() == RESOLVED_FONTS {
             resolved.remove(0);
@@ -1112,20 +1116,22 @@ pub(crate) fn resolve_font(text_system: &crate::TextSystem, font: &crate::Font) 
     font_id
 }
 
-/// [`TextSystem::resolve_font`]: the font, or else the first of the
-/// fallbacks that resolves — in the weight and style asked for, with the
-/// features asked for, where the fallback family has them.
+/// The first of the `fallbacks` that resolves for `font`, which did not
+/// resolve itself: each in the weight and style asked for, with the features
+/// asked for, where the fallback family has them, and else as the stack
+/// names it. `lookup` is upstream's cached font lookup.
 ///
 /// Upstream resolves a fallback as the fallback stack names it, plain: text
 /// asked for in bold came out regular, and with its features — tabular
 /// numerals, say — dropped, so digits of a family that isn't installed took
 /// their proportional widths, and a ticking price changed width, and laid
 /// out its row again, every time it changed.
-fn resolve_font_uncached(text_system: &crate::TextSystem, font: &crate::Font) -> crate::FontId {
-    if let Ok(font_id) = text_system.font_id(font) {
-        return font_id;
-    }
-    for fallback in &text_system.fallback_font_stack {
+pub(crate) fn find_fallback(
+    font: &crate::Font,
+    fallbacks: &[crate::Font],
+    mut lookup: impl FnMut(&crate::Font) -> Option<crate::FontId>,
+) -> Option<crate::FontId> {
+    fallbacks.iter().find_map(|fallback| {
         let as_asked = crate::Font {
             family: fallback.family.clone(),
             features: font.features.clone(),
@@ -1133,23 +1139,8 @@ fn resolve_font_uncached(text_system: &crate::TextSystem, font: &crate::Font) ->
             weight: font.weight,
             style: font.style,
         };
-        if let Ok(font_id) = text_system.font_id(&as_asked) {
-            return font_id;
-        }
-        if let Ok(font_id) = text_system.font_id(fallback) {
-            return font_id;
-        }
-    }
-    panic!(
-        "failed to resolve font '{}' or any of the fallbacks: {}",
-        font.family,
-        text_system
-            .fallback_font_stack
-            .iter()
-            .map(|fallback| fallback.family.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+        lookup(&as_asked).or_else(|| lookup(fallback))
+    })
 }
 
 #[cfg(test)]

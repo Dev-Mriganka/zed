@@ -46,7 +46,7 @@ struct Before {
 /// counted. Called before the event's listeners run.
 pub(crate) fn begin_dispatch(window: &mut Window, cx: &App, event: &PlatformInput) {
     let before = (COMPILED
-        && matches!(event, PlatformInput::ScrollWheel(_))
+        && matches!(event, PlatformInput::Scroll(_))
         && !window.fast_layers.layers.is_empty())
     .then(|| Before {
         changes: crate::fast::dependencies::change_count(cx),

@@ -1486,11 +1486,11 @@ pub(crate) fn event_target(window: &Window, event: &PlatformInput) -> Option<Com
         PlatformInput::MouseDown(_)
             | PlatformInput::MouseUp(_)
             | PlatformInput::MouseMove(_)
-            | PlatformInput::ScrollWheel(_)
+            | PlatformInput::Scroll(_)
     ) {
         return None;
     }
-    let scroll = matches!(event, PlatformInput::ScrollWheel(_));
+    let scroll = matches!(event, PlatformInput::Scroll(_));
     if !scroll {
         let state = window.fast_composition.0.borrow();
         if let Some(captured) = state.pointer_capture {
@@ -1527,7 +1527,7 @@ pub(crate) fn dispatch_native(
             | PlatformInput::MouseUp(_)
             | PlatformInput::MouseMove(_)
             | PlatformInput::MouseExited(_)
-            | PlatformInput::ScrollWheel(_)
+            | PlatformInput::Scroll(_)
     );
     if !pointer || !window.fast_composition.0.borrow().enabled {
         return;

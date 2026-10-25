@@ -1799,7 +1799,7 @@ pub(crate) fn begin_list(
     let frame = RowsFrame {
         mode,
         list: Some(version.id()),
-        skip_held: mode == Mode::Extend && state.pending_scroll.is_none() && !layer.rows.rerendered,
+        skip_held: mode == Mode::Extend && !state.fast_scroll_pending() && !layer.rows.rerendered,
         needed: 0..0,
         retain: 0..0,
         stale: BTreeSet::new(),
@@ -1854,7 +1854,7 @@ pub(crate) fn note_at_end_read(state: &crate::StateInner) {
 /// nothing once the list is there, though laying the list out puts its
 /// offset in other terms.
 pub(crate) fn note_scrolled_to_end(state: &crate::StateInner) {
-    let there = state.pending_scroll.is_none() && scrolled_to_end(state) == Some(true);
+    let there = !state.fast_scroll_pending() && scrolled_to_end(state) == Some(true);
     state.version.bump_if(!there);
 }
 

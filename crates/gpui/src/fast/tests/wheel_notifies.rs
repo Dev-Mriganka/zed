@@ -3,7 +3,7 @@
 
 use crate::{
     AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    Pixels, PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    Pixels, PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollEvent,
     StatefulInteractiveElement as _, Styled as _, TestAppContext, TouchPhase, Window, WindowHandle,
     canvas, div, point, px, rgb, size,
 };
@@ -59,7 +59,7 @@ impl Render for Page {
                 );
                 window.paint_quad(crate::fill(thumb, rgb(0x888888)));
                 let view = window.current_view();
-                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+                window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
                     if phase.bubble()
                         && viewport().contains(&event.position)
                         && handle.offset() != seen.get()
@@ -135,7 +135,7 @@ fn scroll_both(cx: &mut TestAppContext, update: bool, events: usize) -> usize {
             cx.update_window(window.into(), |_, window, cx| {
                 for _ in 0..events {
                     window.dispatch_event(
-                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        PlatformInput::Scroll(ScrollEvent {
                             position: point(px(20.), px(20.)),
                             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                             modifiers: Default::default(),

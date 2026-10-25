@@ -5,7 +5,7 @@
 use crate::fast::layers::policy::{Decision, last_decision};
 use crate::{
     AnyWindowHandle, App, AppContext as _, Bounds, GlobalElementId, Hsla, ScaledPixels, Scene,
-    ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, Window, point, px,
+    ScrollDelta, ScrollEvent, TestAppContext, TouchPhase, Window, point, px,
 };
 
 /// How tall the list is, in pixels.
@@ -34,7 +34,7 @@ fn wheel(cx: &mut TestAppContext, window: AnyWindowHandle, dy: f32) {
     let frame = with_window(cx, window, |window, _| window.fast_layers.frame);
     with_window(cx, window, |window, cx| {
         window.dispatch_event(
-            crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+            crate::PlatformInput::Scroll(ScrollEvent {
                 position: point(px(20.), px(20.)),
                 delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                 modifiers: Default::default(),
@@ -3703,7 +3703,7 @@ mod animation {
         with_window(cx, window, |window, cx| {
             window.simulate_next_frame(cx);
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                crate::PlatformInput::Scroll(crate::ScrollEvent {
                     position: crate::point(px(20.), px(20.)),
                     delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(dy))),
                     modifiers: Default::default(),
@@ -3946,7 +3946,7 @@ mod layout_states {
         AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Element, ElementId,
         FollowMode, GlobalElementId, InspectorElementId, IntoElement, LayoutId, ListAlignment,
         ListSizingBehavior, ListState, ParentElement as _, Pixels, Render, ScrollDelta,
-        ScrollWheelEvent, Styled as _, Task, TestAppContext, TouchPhase, Window, WindowHandle, div,
+        ScrollEvent, Styled as _, Task, TestAppContext, TouchPhase, Window, WindowHandle, div,
         point, px, rgb,
     };
     use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
@@ -4186,7 +4186,7 @@ mod layout_states {
         let frame = with_window(cx, window, |window, _| window.fast_layers.frame);
         with_window(cx, window, |window, cx| {
             window.dispatch_event(
-                crate::PlatformInput::ScrollWheel(ScrollWheelEvent {
+                crate::PlatformInput::Scroll(ScrollEvent {
                     position: point(px(20.), px(20.)),
                     delta,
                     modifiers: Default::default(),

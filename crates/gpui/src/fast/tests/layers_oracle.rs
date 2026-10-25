@@ -37,7 +37,7 @@ use crate::{
     KeyDownEvent, LayerFrame, LayerKey, ListAlignment, ListOffset, ListState, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoopTextSystem, ParentElement as _,
     Pixels, PlatformInput, Point, PolychromeSprite, Quad, Render, ScaledPixels, Scene, ScrollDelta,
-    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    ScrollHandle, ScrollStrategy, ScrollEvent, SharedString, StatefulInteractiveElement as _,
     Styled as _, TestAppContext, TileCoord, TouchPhase, UniformListScrollHandle, Window,
     WindowHandle, canvas, div, hsla, layer_tile_id, layer_tile_texture_id, list, point, px, rgba,
     size, uniform_list, util::FluentBuilder as _, white,
@@ -649,7 +649,7 @@ fn apply(cx: &mut TestAppContext, window: WindowHandle<LayerOracleView>, change:
         } => dispatch(
             cx,
             window,
-            ScrollWheelEvent {
+            ScrollEvent {
                 position: point(
                     px(container_left(container) + CONTAINER_WIDTH / 2.),
                     px(CONTAINER_TOP + y),
