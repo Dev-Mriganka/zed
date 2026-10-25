@@ -1243,6 +1243,11 @@ enum InputModality {
     Touch,
 }
 
+thread_local! {
+    /// The window that last saw the pointer move or press (`Window::take_pointer_from_other_windows`).
+    static POINTER_WINDOW: std::cell::Cell<Option<WindowId>> = const { std::cell::Cell::new(None) };
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -4034,9 +4039,22 @@ impl Window {
 
             // CDXC:Tooltips 2026-09-24 DECISION:
             // User: a tooltip that leaves its pane "can end up cut off under the CEF pane if it's next to the one we're in"; tooltips must dodge the frames native views cover (they draw over everything GPUI paints) rather than stay inside their own pane, and one wider than the room next to its trigger wraps to that room instead of being shortened. The region's edge on the pointer's row is treated like a window edge: the tooltip flips to the pointer's other side first, then shifts, and the element is laid out inside a box no wider than the room so its text wraps.
-            let occlusions = self.next_frame.native_occlusions.clone();
+            //
+            // CDXC:Tooltips 2026-10-25 WHY:
+            // A tooltip handed to a presenter draws in a window of its own above this one (Ghostex's frosted tooltip host), so native views cannot cover it and it has the whole window to fit in. Fitting it into the gap between native views instead (the Files panel beside a terminal, say) left a card wider than that gap pinned to the gap's left edge, running past the window's right edge.
+            let occlusions = if self.tooltip_presenter.is_some() {
+                Vec::new()
+            } else {
+                self.next_frame.native_occlusions.clone()
+            };
             let mut left_limit = Pixels::ZERO;
-            let mut right_limit = window_bounds.right();
+            // A presented tooltip is kept inside the app window by its host, which can reach past a
+            // narrow child window's edges, so it is not flipped or shifted against this one's.
+            let mut right_limit = if self.tooltip_presenter.is_some() {
+                Pixels::MAX
+            } else {
+                window_bounds.right()
+            };
             if !occlusions.is_empty() {
                 let gap = native_occlusion_row_gap(
                     Bounds::new(mouse_position, size(px(1.), px(1.))),
@@ -4060,9 +4078,11 @@ impl Window {
                 if new_x >= left_limit {
                     tooltip_bounds.origin.x = new_x;
                 } else {
+                    // Shift left until the right edge meets the limit (the stock formula,
+                    // `origin - right - limit`, always landed on the left limit).
                     tooltip_bounds.origin.x = cmp::max(
                         left_limit,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - right_limit,
+                        right_limit - tooltip_bounds.size.width - px(1.),
                     );
                 }
             }
@@ -4074,7 +4094,7 @@ impl Window {
                 } else {
                     tooltip_bounds.origin.y = cmp::max(
                         Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+                        window_bounds.bottom() - tooltip_bounds.size.height - px(1.),
                     );
                 }
             }
@@ -5940,6 +5960,12 @@ impl Window {
                 | PlatformInput::FileDrop(_)
         ) {
             self.pointer_left_window = false;
+            if matches!(
+                event,
+                PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_)
+            ) {
+                self.take_pointer_from_other_windows(cx);
+            }
         }
 
         let ambient = crate::fast::dependencies::AmbientInput::of(self);
@@ -6268,6 +6294,45 @@ impl Window {
                 window.schedule_touch_momentum_tick();
             }
         });
+    }
+
+    /// The pointer moved or pressed in this window: every other window that still believes it
+    /// has the pointer is told it left, as macOS would if the pointer had crossed its edge.
+    ///
+    /// CDXC:Tooltips 2026-10-25 DECISION:
+    /// User: the Files view's "Show files" tooltip "keeps being shown even after the files bar appears and goes over that button and im not hovering that button anymore and it's fighting with tooltips of other files". A window that one of the app's own windows opens over (a floating panel, a menu, a popover) never hears the pointer leave, because the pointer never crosses its edge, so its hovered element and that element's tooltip stayed up. Pointer input reaching another window now ends hover in the window that had it, so a tooltip closes when its window loses the pointer or its element is covered, and only the window under the pointer can show one.
+    fn take_pointer_from_other_windows(&mut self, cx: &mut App) {
+        let this = self.handle;
+        let changed = POINTER_WINDOW.with(|owner| owner.replace(Some(this.window_id())))
+            != Some(this.window_id());
+        if !changed {
+            return;
+        }
+        cx.defer(move |cx| {
+            for other in cx.windows() {
+                if other == this {
+                    continue;
+                }
+                other
+                    .update(cx, |_, window, cx| window.lose_pointer_to_other_window(cx))
+                    .ok();
+            }
+        });
+    }
+
+    /// Ends hover here the way a real `MouseExited` does, unless the pointer already left.
+    fn lose_pointer_to_other_window(&mut self, cx: &mut App) {
+        if self.pointer_left_window {
+            return;
+        }
+        self.dispatch_event(
+            PlatformInput::MouseExited(crate::MouseExitEvent {
+                position: self.mouse_position,
+                pressed_button: None,
+                modifiers: self.modifiers,
+            }),
+            cx,
+        );
     }
 
     /// What is under the pointer in `frame`: nothing while the pointer is outside the window.
