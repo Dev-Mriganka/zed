@@ -61,6 +61,12 @@ pub(crate) fn draw_primitives_to_texture(
     texture: &metal::TextureRef,
     viewport_size: Size<DevicePixels>,
 ) -> Result<Option<metal::CommandBuffer>> {
+    // Ghostex: the window's path textures are allocated by the first frame that draws a path
+    // (and freed while the window is hidden), so allocate them before either renderer below
+    // rasterizes paths through them; the rounded-clip one reads them too.
+    if !scene.paths.is_empty() {
+        renderer.ensure_window_path_textures(viewport_size);
+    }
     if crate::fast::rounded_clip::has_groups(scene) {
         return crate::fast::rounded_clip::draw(
             renderer,
@@ -75,7 +81,6 @@ pub(crate) fn draw_primitives_to_texture(
     if scene.paths.is_empty() {
         return Ok(None);
     }
-    renderer.ensure_window_path_textures(viewport_size);
     let path_batches = plan_paths(scene);
     let vertices = write_vertices(scene, &path_batches, writer)?;
 
