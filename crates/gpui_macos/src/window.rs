@@ -65,7 +65,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString, c_void},
     mem,
     ops::Range,
@@ -81,12 +81,14 @@ use std::{
 };
 
 pub(crate) const WINDOW_STATE_IVAR: &str = "windowState";
+const A11Y_STATE_IVAR: &str = "a11yState";
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
 static mut VIEW_CLASS: *const Class = ptr::null();
+static mut CONTENT_VIEW_CLASS: *const Class = ptr::null();
 static mut BLURRED_VIEW_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_ARCHIVER_DELEGATE_CLASS: *const Class = ptr::null();
 static mut WINDOW_STATE_UNARCHIVER_CLASS: *const Class = ptr::null();
@@ -301,6 +303,27 @@ unsafe fn build_classes() {
             decl.add_method(
                 sel!(characterIndexForPoint:),
                 character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+            );
+            decl.register()
+        };
+        CONTENT_VIEW_CLASS = {
+            let mut decl = ClassDecl::new("GPUIContentView", class!(NSView)).unwrap();
+            decl.add_ivar::<*mut c_void>(A11Y_STATE_IVAR);
+            decl.add_method(
+                sel!(dealloc),
+                dealloc_content_view as extern "C" fn(&Object, Sel),
+            );
+            decl.add_method(
+                sel!(accessibilityChildren),
+                content_view_accessibility_children as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(accessibilityFocusedUIElement),
+                content_view_accessibility_focused_element as extern "C" fn(&Object, Sel) -> id,
+            );
+            decl.add_method(
+                sel!(accessibilityHitTest:),
+                content_view_accessibility_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
             );
             decl.register()
         };
@@ -762,7 +785,7 @@ pub(crate) struct MacWindowState {
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
     activated_least_once: bool,
     closed: Arc<AtomicBool>,
-    accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
+    accesskit_adapter: Option<Rc<RefCell<A11yState>>>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
 }
@@ -1140,7 +1163,11 @@ impl MacWindow {
                 setReleasedWhenClosed: NO
             ];
 
-            let content_view = native_window.contentView();
+            let content_view: id = msg_send![CONTENT_VIEW_CLASS, alloc];
+            let content_view =
+                NSView::initWithFrame_(content_view, NSView::bounds(native_window.contentView()));
+            assert!(!content_view.is_null());
+            native_window.setContentView_(content_view.autorelease());
             let native_view: id = msg_send![VIEW_CLASS, alloc];
             let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
@@ -1452,15 +1479,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
-        // `accesskit_macos::SubclassingAdapter::for_window` strong-retains the
-        // window's content view, and that content view keeps the `GPUIView` it
-        // hosts alive. Together with the `Arc<Mutex<MacWindowState>>` parked in
-        // both views' `windowState` ivar, that forms
-        // `MacWindowState -> adapter -> content view -> GPUIView -> MacWindowState`,
-        // a cycle the delegate/`frame_source` teardown below cannot break. Drop
-        // the adapter here so the native view, its `CAMetalLayer` and the
-        // renderer's command queue are actually released with the window.
-        drop(this.accesskit_adapter.take());
+        this.accesskit_adapter.take();
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -2613,23 +2632,24 @@ impl PlatformWindow for MacWindow {
         };
         let action_handler = A11yActionHandler(callbacks.action);
 
-        let adapter = unsafe {
-            accesskit_macos::SubclassingAdapter::for_window(
-                lock.native_window as *mut c_void,
-                activation_handler,
-                action_handler,
-            )
-        };
-
-        lock.accesskit_adapter = Some(adapter);
+        let content_view = unsafe { lock.native_window.contentView() };
+        let state = Rc::new(RefCell::new(A11yState {
+            // SAFETY: the content view is the live `GPUIContentView` the window was created with.
+            adapter: unsafe {
+                accesskit_macos::Adapter::new(content_view as *mut c_void, false, action_handler)
+            },
+            activation_handler,
+        }));
+        unsafe { set_content_view_a11y_state(content_view, Some(state.clone())) };
+        lock.accesskit_adapter = Some(state);
     }
 
     fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
         let events = {
-            let mut lock = self.0.lock();
+            let lock = self.0.lock();
             lock.accesskit_adapter
-                .as_mut()
-                .and_then(|adapter| adapter.update_if_active(|| tree_update))
+                .as_ref()
+                .and_then(|state| state.borrow_mut().adapter.update_if_active(|| tree_update))
         };
         if let Some(events) = events {
             events.raise();
@@ -2652,6 +2672,98 @@ impl accesskit::ActivationHandler for A11yActivationHandler {
 }
 
 struct A11yActionHandler(Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>);
+
+/// The window's AccessKit adapter, answered from `GPUIContentView`'s own accessibility methods.
+///
+/// This replaces `accesskit_macos::SubclassingAdapter`, which swapped the content view's class with
+/// `object_setClass` when the window opened and swapped it back when the window was dropped. AppKit's
+/// Touch Bar finder (it runs on Macs without a Touch Bar too) key-value observes `nextResponder` on
+/// every responder of the key window, and KVO does that by swapping the same view's class for its
+/// own `NSKVONotifying_` subclass. Dropping a key window (closing a popup menu or any child window
+/// that took focus) restored the original class over KVO's, so the finder's next update threw
+/// "Cannot remove an observer ... because it is not registered as an observer" (`NSRangeException`)
+/// from the display cycle and the app quit. A declared class never changes an instance's class.
+struct A11yState {
+    adapter: accesskit_macos::Adapter,
+    activation_handler: A11yActivationHandler,
+}
+
+/// Stores `state` in the content view, releasing what it held before.
+///
+/// # Safety
+///
+/// `content_view` must be a live `GPUIContentView`, used on the main thread.
+unsafe fn set_content_view_a11y_state(content_view: id, state: Option<Rc<RefCell<A11yState>>>) {
+    unsafe {
+        let previous: *mut c_void = *(*content_view).get_ivar(A11Y_STATE_IVAR);
+        let raw = state.map_or(ptr::null_mut(), |state| Rc::into_raw(state) as *mut c_void);
+        (*content_view).set_ivar::<*mut c_void>(A11Y_STATE_IVAR, raw);
+        if !previous.is_null() {
+            drop(Rc::from_raw(previous as *const RefCell<A11yState>));
+        }
+    }
+}
+
+fn content_view_a11y_state(this: &Object) -> Option<Rc<RefCell<A11yState>>> {
+    unsafe {
+        let raw: *mut c_void = *this.get_ivar(A11Y_STATE_IVAR);
+        if raw.is_null() {
+            return None;
+        }
+        let raw = raw as *const RefCell<A11yState>;
+        Rc::increment_strong_count(raw);
+        Some(Rc::from_raw(raw))
+    }
+}
+
+extern "C" fn dealloc_content_view(this: &Object, _: Sel) {
+    unsafe {
+        set_content_view_a11y_state(this as *const Object as id, None);
+        let _: () = msg_send![super(this, class!(NSView)), dealloc];
+    }
+}
+
+extern "C" fn content_view_accessibility_children(this: &Object, _: Sel) -> id {
+    if let Some(state) = content_view_a11y_state(this)
+        && let Ok(mut state) = state.try_borrow_mut()
+    {
+        let A11yState {
+            adapter,
+            activation_handler,
+        } = &mut *state;
+        return adapter.view_children(activation_handler) as id;
+    }
+    unsafe { msg_send![super(this, class!(NSView)), accessibilityChildren] }
+}
+
+extern "C" fn content_view_accessibility_focused_element(this: &Object, _: Sel) -> id {
+    if let Some(state) = content_view_a11y_state(this)
+        && let Ok(mut state) = state.try_borrow_mut()
+    {
+        let A11yState {
+            adapter,
+            activation_handler,
+        } = &mut *state;
+        return adapter.focus(activation_handler) as id;
+    }
+    unsafe { msg_send![super(this, class!(NSView)), accessibilityFocusedUIElement] }
+}
+
+extern "C" fn content_view_accessibility_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    if let Some(state) = content_view_a11y_state(this)
+        && let Ok(mut state) = state.try_borrow_mut()
+    {
+        let A11yState {
+            adapter,
+            activation_handler,
+        } = &mut *state;
+        return adapter.hit_test(
+            accesskit_macos::NSPoint::new(point.x, point.y),
+            activation_handler,
+        ) as id;
+    }
+    unsafe { msg_send![super(this, class!(NSView)), accessibilityHitTest: point] }
+}
 
 impl accesskit::ActionHandler for A11yActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
@@ -3697,10 +3809,13 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     drop(lock);
 
     let a11y_events = {
-        let mut lock = window_state.lock();
-        lock.accesskit_adapter
-            .as_mut()
-            .and_then(|adapter| adapter.update_view_focus_state(is_active))
+        let lock = window_state.lock();
+        lock.accesskit_adapter.as_ref().and_then(|state| {
+            state
+                .borrow_mut()
+                .adapter
+                .update_view_focus_state(is_active)
+        })
     };
     if let Some(events) = a11y_events {
         events.raise();
