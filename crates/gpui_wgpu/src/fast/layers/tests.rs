@@ -26,6 +26,81 @@ use crate::wgpu_renderer::{
     WgpuRendererCore,
 };
 
+/// Reuse a target and wait for GPU completion, excluding pixel readback.
+#[gpui::test]
+#[ignore = "manual GPU performance measurement"]
+fn rounded_overflow_frame_cost(cx: &mut gpui::TestAppContext) {
+    fn rectangular() -> gpui::Div {
+        use gpui::{ParentElement as _, Styled as _};
+        gpui::div()
+            .flex()
+            .flex_wrap()
+            .size(px(64.))
+            .bg(gpui::white())
+            .children((0..64).map(|_| {
+                gpui::div()
+                    .size(px(8.))
+                    .overflow_hidden()
+                    .child(gpui::div().size(px(8.)).bg(gpui::black()))
+            }))
+    }
+    for side in [128, 1024] {
+        for (name, build) in [
+            ("rectangle", rectangular as fn() -> gpui::Div),
+            ("rounded", rounded_clip_tests::sibling_fixture),
+        ] {
+            let mut harness = Harness::new().expect("timing requires a GPU");
+            rounded_clip_tests::render_with(cx, build, |scene, _| {
+                harness.write_globals(side, side);
+                harness.ensure_path_targets(device_size(side as i32, side as i32));
+                let texture = harness.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("clip_timing_target"),
+                    size: wgpu::Extent3d {
+                        width: side,
+                        height: side,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: harness.format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                let mut samples = Vec::new();
+                for frame in 0..18 {
+                    let start = std::time::Instant::now();
+                    let submission = crate::fast::frame::record_into(
+                        &mut harness,
+                        scene,
+                        &view,
+                        wgpu::Color::WHITE,
+                    )
+                    .unwrap();
+                    let encoded = start.elapsed();
+                    harness
+                        .device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: Some(submission),
+                            timeout: None,
+                        })
+                        .unwrap();
+                    if frame >= 3 {
+                        samples.push((start.elapsed(), encoded));
+                    }
+                }
+                samples.sort();
+                eprintln!(
+                    "64 {name} clips, {side}px target: median {:?}, encode {:?}",
+                    samples[7].0, samples[7].1
+                );
+                Vec::new()
+            });
+        }
+    }
+}
+
 #[test]
 fn harness_renders_a_quad_at_the_right_pixels() {
     let Some(mut harness) = Harness::new() else {
@@ -41,6 +116,43 @@ fn harness_renders_a_quad_at_the_right_pixels() {
 }
 
 const TILE: u32 = 512;
+
+#[cfg(feature = "test-support")]
+#[path = "../../../../gpui/src/fast/rounded_clip_fixtures.rs"]
+mod rounded_clip_tests;
+
+#[cfg(all(feature = "test-support", not(target_family = "wasm")))]
+#[path = "rounded_clip_texture_tests.rs"]
+mod rounded_clip_texture_tests;
+
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn rounded_overflow_retained_child_follows_ancestor_clip(cx: &mut gpui::TestAppContext) {
+    let mut harness = Harness::new().expect("retained clipping regression requires a GPU");
+    rounded_clip_tests::retained_frames(cx, |scene, size| {
+        harness.render(scene, size, rgba(0xffffffff))
+    });
+}
+
+fn render_div_fixture(cx: &mut gpui::TestAppContext, build: fn() -> gpui::Div) -> (Vec<u8>, usize) {
+    let mut harness = Harness::new().expect("rounded clipping regression requires a wgpu adapter");
+    rounded_clip_tests::render_with(cx, build, |scene, size| {
+        harness.render(scene, size, rgba(0xffffffff))
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn rounded_overflow_inside_scroll_tiles_matches_direct_pixels(cx: &mut gpui::TestAppContext) {
+    let mut harness = Harness::new().expect("rounded clipping regression requires a wgpu adapter");
+    rounded_clip_tests::render_with(cx, rounded_clip_tests::square_fixture, |scene, size| {
+        let direct = harness.render(scene, size, rgba(0xffffffff));
+        let tiled = rounded_clip_tests::tiled_scene(scene, size);
+        let actual = harness.render(&tiled, size, rgba(0xffffffff));
+        assert_same_pixels(&actual, &direct, size.width.0 as usize);
+        actual
+    });
+}
 
 #[test]
 fn a_rasterized_tile_equals_the_same_content_drawn_directly() {
@@ -104,6 +216,21 @@ fn paths_composite_exactly_at_even_translations() {
     composite_and_compare(&mut harness, (38., -92.), Paths::With);
 }
 
+/// Paths something draws over stay out of the tiles: the core draws them,
+/// and what it draws over them, over the composited tiles
+/// (`gpui::fast::layers::overlay`), as without a layer. That holds at odd
+/// translations too, as the paths are rasterized where they show.
+#[test]
+fn covered_paths_drawn_over_the_tiles_equal_direct_drawing() {
+    let Some(mut harness) = Harness::new() else {
+        eprintln!("skipped: no wgpu adapter");
+        return;
+    };
+    for translation in [(37., -91.), (38., -92.), (3., 5.), (101., -233.)] {
+        composite_and_compare(&mut harness, translation, Paths::Covered);
+    }
+}
+
 /// Draws a window with a viewport over a scroll layer at `translation`, once
 /// from the content directly and once from the layer's tiles, twice (the
 /// second frame from the cached tiles), and compares the pixels.
@@ -116,6 +243,9 @@ fn composite_and_compare(harness: &mut Harness, translation: (f32, f32), paths: 
     let mut direct = Scene::default();
     direct.insert_primitive(panel);
     add_content(&mut direct, harness, translation, viewport, paths);
+    if paths == Paths::Covered {
+        add_covered_paths(&mut direct, harness, translation, viewport);
+    }
     direct.insert_primitive(scrollbar);
     direct.finish();
     let expected = harness.render(&direct, window, rgba(0x000000ff));
@@ -158,6 +288,9 @@ fn composite_and_compare(harness: &mut Harness, translation: (f32, f32), paths: 
         });
     }
     composited.pop_layer();
+    if paths == Paths::Covered {
+        add_covered_paths(&mut composited, harness, translation, viewport);
+    }
     composited.insert_primitive(scrollbar);
     composited.layers.frames.push(layer);
     composited.finish();
@@ -411,6 +544,8 @@ fn content(
 enum Paths {
     With,
     Without,
+    /// No path in the tiles; [`add_covered_paths`] over them.
+    Covered,
 }
 
 fn add_content(
@@ -529,6 +664,64 @@ fn add_path(scene: &mut Scene, (ox, oy): (f32, f32), clip: Bounds<ScaledPixels>)
         point(px(600. + ox), px(450. + oy)),
     );
     path.line_to(point(px(480. + ox), px(300. + oy)));
+    path.content_mask = ContentMask {
+        bounds: clip.map(|c| px(c.0)),
+    };
+    path.color = Hsla::from(rgba(0x8800ffcc)).into();
+    scene.insert_primitive(path.scale(1.));
+}
+
+/// What GPUI Kit draws for a table's rounded frame: paths filling corner
+/// notches, a bordered quad and a glyph drawn over them, and a path nothing
+/// covers, moved by `offset` and clipped to `clip`, in drawing order.
+fn add_covered_paths(
+    scene: &mut Scene,
+    harness: &Harness,
+    (ox, oy): (f32, f32),
+    clip: Bounds<ScaledPixels>,
+) {
+    let mask = ContentMask { bounds: clip };
+    for (x, y, dx, dy) in [
+        (200., 330., 1., 1.),
+        (330.5, 330., -1., 1.),
+        (200., 410.25, 1., -1.),
+    ] {
+        let corner = point(px(x + ox), px(y + oy));
+        let mut path = Path::new(corner);
+        path.line_to(corner + point(px(9. * dx), px(0.)));
+        path.curve_to(corner + point(px(0.), px(9. * dy)), corner);
+        path.line_to(corner);
+        path.content_mask = ContentMask {
+            bounds: clip.map(|c| px(c.0)),
+        };
+        path.color = Hsla::from(rgba(0x3366ccff)).into();
+        scene.insert_primitive(path.scale(1.));
+    }
+    scene.insert_primitive(Quad {
+        bounds: sp(200. + ox, 330. + oy, 130.5, 80.25),
+        content_mask: mask,
+        background: Hsla::from(rgba(0x00000000)).into(),
+        border_color: Hsla::from(rgba(0x222222ff)),
+        corner_radii: Corners::all(ScaledPixels(9.)),
+        border_widths: Edges::all(ScaledPixels(1.)),
+        ..Default::default()
+    });
+    scene.insert_primitive(MonochromeSprite {
+        order: 0,
+        pad: 0,
+        bounds: sp(204. + ox, 334. + oy, 16., 16.),
+        content_mask: mask,
+        color: Hsla::from(rgba(0xff8800ff)),
+        tile: glyph_tile(harness, 1, false),
+        transformation: TransformationMatrix::unit(),
+    });
+    let mut path = Path::new(point(px(250. + ox), px(360. + oy)));
+    path.line_to(point(px(290.5 + ox), px(372. + oy)));
+    path.curve_to(
+        point(px(255. + ox), px(400. + oy)),
+        point(px(300. + ox), px(395. + oy)),
+    );
+    path.line_to(point(px(250. + ox), px(360. + oy)));
     path.content_mask = ContentMask {
         bounds: clip.map(|c| px(c.0)),
     };
@@ -662,7 +855,7 @@ impl Harness {
     /// `None` when there is none (the tests then skip).
     pub(super) fn new() -> Option<Harness> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL | wgpu::Backends::METAL,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -672,6 +865,7 @@ impl Harness {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         let (device, queue, dual_source_blending, color_texture_format) =
@@ -916,7 +1110,7 @@ impl FrameHost for Harness {
             path_globals_bind_group: &self.path_globals_bind_group,
             path_intermediate_view: path_targets.map(|targets| &targets.intermediate_view),
             path_msaa_view: path_targets.and_then(|targets| targets.msaa_view.as_ref()),
-            instance_buffer: &self.instance_buffer,
+            instance_data: crate::fast::frame::InstanceSource::Storage(&self.instance_buffer),
             globals_buffer: &self.globals_buffer,
             gamma_offset: self.gamma_offset,
             gamma_size: size_of::<GammaParams>() as u64,
@@ -987,7 +1181,7 @@ pub(super) fn read_back(
             timeout: None,
         })
         .expect("device polled");
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("buffer mapped");
     let mut pixels = Vec::with_capacity((row * height) as usize);
     for y in 0..height {
         let start = (y * padded_row) as usize;

@@ -125,6 +125,9 @@ impl LayerFrame {
                     scene.push_layer(translate_bounds(*layer_bounds, delta))
                 }
                 PaintOperation::EndLayer => scene.pop_layer(),
+                PaintOperation::FastRoundedClip(clip) => {
+                    crate::fast::rounded_clip::record(&mut scene, clip.translated(delta))
+                }
             }
         }
         scene.finish();
@@ -326,7 +329,11 @@ pub(crate) fn move_primitive(primitive: &mut Primitive, delta: Point<ScaledPixel
             mv(&mut path.content_mask.bounds);
             for vertex in &mut path.vertices {
                 vertex.xy_position = vertex.xy_position + delta;
-                mv(&mut vertex.content_mask.bounds);
+                // `Window::paint_path` leaves vertices' masks empty, at the
+                // origin, and no renderer reads them: they stay so.
+                if !vertex.content_mask.bounds.is_empty() {
+                    mv(&mut vertex.content_mask.bounds);
+                }
             }
         }
         Primitive::Underline(underline) => {

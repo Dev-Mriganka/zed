@@ -12,7 +12,7 @@
 //! a compositing manager blends windows with an ARGB visual, the GPUI content
 //! stacked above the native surfaces is instead drawn into a transparent
 //! override-redirect window kept over the window, which the compositing
-//! manager blends over the native content. Its input shape is its content, so
+//! manager blends over the native content. Its input shape uses GPUI hitboxes, so
 //! input elsewhere reaches the windows below it, and its input is delivered
 //! to the window it covers.
 
@@ -26,9 +26,9 @@ use std::{
 use anyhow::{Context as _, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use gpui::{
-    Bounds, ComposedScene, CompositionSurfaceId, ContentMask, DevicePixels,
-    PlatformCompositionSurface, PlatformCompositionSurfaceContent, PlatformSurfaceAttachment,
-    PlatformWindow, Point, ScaledPixels, Scene, Size,
+    Bounds, ComposedScene, CompositionSurfaceId, DevicePixels, PlatformCompositionSurface,
+    PlatformCompositionSurfaceContent, PlatformSurfaceAttachment, PlatformWindow, Point, Scene,
+    Size,
 };
 use gpui_util::ResultExt as _;
 use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig, wgpu};
@@ -67,6 +67,7 @@ impl Composition {
             order: Vec::new(),
             occluders: FxHashMap::default(),
             overlay: Overlay::Unknown,
+            input_windows: Vec::new(),
         })))
     }
 
@@ -87,6 +88,7 @@ struct X11Composition {
     order: Vec<PlatformCompositionSurface>,
     occluders: FxHashMap<CompositionSurfaceId, Vec<Bounds<DevicePixels>>>,
     overlay: Overlay,
+    input_windows: Vec<xproto::Window>,
 }
 
 struct X11NativeSurfaceState {
@@ -203,6 +205,7 @@ impl X11NativeSurfaceState {
     }
 
     fn destroy(&mut self) {
+        INPUT_WINDOWS.with(|windows| windows.borrow_mut().remove(&self.x_window));
         if std::mem::replace(&mut self.destroyed, true) {
             return;
         }
@@ -224,107 +227,8 @@ fn x11_rectangle(bounds: Bounds<DevicePixels>) -> xproto::Rectangle {
     }
 }
 
-/// Past this many rectangles an occluding surface is cut out by its bounding
-/// box, which keeps shape requests small for text-heavy overlays.
-const MAX_OCCLUDER_RECTANGLES: usize = 256;
-
-/// Returns the device-pixel rectangles covered by a scene's primitives.
-///
-/// Shadows are left out: a cutout can only show the window's pixels, not blend
-/// a translucent shadow over the native content, so cutting out a shadow would
-/// replace native content with GPUI's background around every overlay.
 fn scene_occluders(scene: &Scene, opaque_only: bool) -> Vec<Bounds<DevicePixels>> {
-    fn clipped(
-        bounds: Bounds<ScaledPixels>,
-        content_mask: &ContentMask<ScaledPixels>,
-    ) -> Bounds<ScaledPixels> {
-        bounds.intersect(&content_mask.bounds)
-    }
-
-    let mut rectangles = Vec::new();
-    rectangles.extend(
-        scene
-            .quads
-            .iter()
-            .filter(|quad| !opaque_only || quad.background.is_opaque())
-            .map(|quad| clipped(quad.bounds, &quad.content_mask)),
-    );
-    rectangles.extend(
-        scene
-            .paths
-            .iter()
-            .map(|path| clipped(path.bounds, &path.content_mask)),
-    );
-    rectangles.extend(
-        scene
-            .underlines
-            .iter()
-            .map(|underline| clipped(underline.bounds, &underline.content_mask)),
-    );
-    rectangles.extend(
-        scene
-            .monochrome_sprites
-            .iter()
-            .map(|sprite| clipped(sprite.bounds, &sprite.content_mask)),
-    );
-    rectangles.extend(
-        scene
-            .subpixel_sprites
-            .iter()
-            .map(|sprite| clipped(sprite.bounds, &sprite.content_mask)),
-    );
-    rectangles.extend(
-        scene
-            .polychrome_sprites
-            .iter()
-            .map(|sprite| clipped(sprite.bounds, &sprite.content_mask)),
-    );
-    rectangles.extend(
-        scene
-            .surfaces
-            .iter()
-            .map(|surface| clipped(surface.bounds, &surface.content_mask)),
-    );
-
-    let mut rectangles = rectangles
-        .into_iter()
-        .map(|bounds| {
-            let origin = bounds
-                .origin
-                .map(|value| DevicePixels(value.0.floor() as i32));
-            let corner = bounds
-                .bottom_right()
-                .map(|value| DevicePixels(value.0.ceil() as i32));
-            Bounds::from_corners(origin, corner)
-        })
-        .filter(|bounds| !bounds.is_empty())
-        .collect::<Vec<_>>();
-
-    // Content usually sits on a background quad, so most rectangles are
-    // covered by a larger one.
-    rectangles.sort_by_key(|bounds| std::cmp::Reverse(bounds.size.width.0 * bounds.size.height.0));
-    let mut kept: Vec<Bounds<DevicePixels>> = Vec::new();
-    for rectangle in rectangles {
-        let covered = kept.iter().any(|kept| {
-            kept.origin.x <= rectangle.origin.x
-                && kept.origin.y <= rectangle.origin.y
-                && kept.bottom_right().x >= rectangle.bottom_right().x
-                && kept.bottom_right().y >= rectangle.bottom_right().y
-        });
-        if !covered {
-            kept.push(rectangle);
-        }
-    }
-    if kept.len() > MAX_OCCLUDER_RECTANGLES {
-        let union = kept
-            .iter()
-            .copied()
-            .reduce(|union, bounds| union.union(&bounds))
-            .into_iter()
-            .collect();
-        return union;
-    }
-    kept
+    super::occluders::scene_occluders(scene, opaque_only)
 }
 
 /// A child window slot for content produced outside GPUI's renderer. Its
@@ -402,6 +306,8 @@ impl X11Composition {
                     deviceid: XINPUT_ALL_DEVICE_GROUPS,
                     mask: vec![
                         xinput::XIEventMask::MOTION
+                            | xinput::XIEventMask::ENTER
+                            | xinput::XIEventMask::LEAVE
                             | xinput::XIEventMask::BUTTON_PRESS
                             | xinput::XIEventMask::BUTTON_RELEASE,
                     ],
@@ -530,6 +436,12 @@ impl X11Composition {
     }
 
     fn destroy(&mut self) {
+        INPUT_WINDOWS.with(|windows| {
+            let mut windows = windows.borrow_mut();
+            for id in self.input_windows.drain(..) {
+                windows.remove(&id);
+            }
+        });
         for surface in self
             .native_surfaces
             .drain(..)
@@ -656,8 +568,13 @@ impl X11Composition {
 
     /// Draws `scene`, the GPUI content above the native surfaces, into the
     /// overlay window, creating it on first use and unmapping it when the
-    /// scene is empty.
-    fn draw_overlay(&mut self, window: &X11Window, scene: &Scene) -> anyhow::Result<()> {
+    /// scene and its input region are empty.
+    fn draw_overlay(
+        &mut self,
+        window: &X11Window,
+        scene: &Scene,
+        input: Vec<Bounds<DevicePixels>>,
+    ) -> anyhow::Result<()> {
         let Overlay::Supported {
             root,
             colormap,
@@ -667,7 +584,7 @@ impl X11Composition {
         else {
             return Ok(());
         };
-        if scene.is_empty() {
+        if scene.is_empty() && input.is_empty() {
             if let Some(overlay) = overlay.take() {
                 *spare_renderer = Some(overlay.destroy(&self.xcb));
                 xcb_flush(&self.xcb);
@@ -712,9 +629,13 @@ impl X11Composition {
                     size,
                 )?;
                 INPUT_WINDOWS.with(|windows| {
-                    windows
-                        .borrow_mut()
-                        .insert(created.x_window, window.0.clone())
+                    windows.borrow_mut().insert(
+                        created.x_window,
+                        InputWindow {
+                            window: window.0.clone(),
+                            native: None,
+                        },
+                    )
                 });
                 overlay.insert(created)
             }
@@ -733,7 +654,7 @@ impl X11Composition {
             ),
             size,
         )?;
-        overlay.set_input(&self.xcb, scene_occluders(scene, false))?;
+        overlay.set_input(&self.xcb, input)?;
         overlay.map(&self.xcb)?;
         overlay.raise_above(&self.xcb, self.x_window);
         overlay.renderer.draw(scene);
@@ -760,16 +681,60 @@ impl X11Composition {
 }
 
 thread_local! {
-    /// The windows that overlay windows cover, by overlay window, so input on
-    /// an overlay window is delivered to the window below it.
-    static INPUT_WINDOWS: RefCell<FxHashMap<xproto::Window, X11WindowStatePtr>> =
+    /// Existing overlay routing plus opted-in native pointer slots. Native
+    /// entries never participate in keyboard or window-configuration lookup.
+    static INPUT_WINDOWS: RefCell<FxHashMap<xproto::Window, InputWindow>> =
         RefCell::default();
 }
 
-/// `X11Client::get_window`'s fallback for an overlay window: the window it
-/// covers, which shares its coordinate space.
+struct InputWindow {
+    window: X11WindowStatePtr,
+    native: Option<Weak<dyn PlatformSurfaceAttachment>>,
+}
+
+/// Overlays and opted-in native slots share the existing window dispatcher.
 pub(crate) fn input_window(x_window: xproto::Window) -> Option<X11WindowStatePtr> {
-    INPUT_WINDOWS.with(|windows| windows.borrow().get(&x_window).cloned())
+    INPUT_WINDOWS.with(|windows| {
+        windows
+            .borrow()
+            .get(&x_window)
+            .filter(|input| input.native.is_none())
+            .map(|input| input.window.clone())
+    })
+}
+
+pub(crate) fn pointer_window(x_window: xproto::Window) -> Option<X11WindowStatePtr> {
+    INPUT_WINDOWS.with(|windows| {
+        let windows = windows.borrow();
+        let input = windows.get(&x_window)?;
+        if let Some(native) = &input.native {
+            native.upgrade()?;
+        }
+        Some(input.window.clone())
+    })
+}
+
+pub(crate) fn pointer_window_id(x_window: xproto::Window) -> xproto::Window {
+    pointer_window(x_window).map_or(x_window, |window| window.x_window)
+}
+
+/// Native XInput coordinates are local to the slot, including during its grab.
+pub(crate) fn pointer_position(
+    x_window: xproto::Window,
+    position: Point<gpui::Pixels>,
+    scale: f32,
+) -> Point<gpui::Pixels> {
+    let native = INPUT_WINDOWS.with(|windows| {
+        windows
+            .borrow()
+            .get(&x_window)
+            .and_then(|input| input.native.clone())
+    });
+    native
+        .and_then(|native| native.upgrade())
+        .map_or(position, |native| {
+            position + native.bounds().to_pixels(scale).origin
+        })
 }
 
 /// Whether a window draws the GPUI content above its native surfaces into an
@@ -1096,9 +1061,18 @@ pub(crate) fn draw_composed(window: &X11Window, scene: ComposedScene<'_>) {
     // the shadows and backdrops blended over native content.
     let mut window_scene = Scene::default();
     let mut overlay_scene = Scene::default();
+    let mut overlay_input = Vec::new();
     let mut occluders = FxHashMap::default();
     for layer in scene.layers() {
         let in_overlay = overlay_surfaces.contains(&layer.surface);
+        if in_overlay {
+            overlay_input.extend(
+                scene
+                    .layer_hitboxes(layer)
+                    .iter()
+                    .map(|hitbox| hitbox.bounds.to_device_pixels(window.scale_factor())),
+            );
+        }
         let cuts_out = track_occluders && layer.surface != base_surface;
         let mut layer_scene = Scene::default();
         for range in &layer.ranges {
@@ -1137,7 +1111,7 @@ pub(crate) fn draw_composed(window: &X11Window, scene: ComposedScene<'_>) {
     }
     if overlay_surfaces.is_empty() {
         composition.hide_overlay();
-    } else if let Err(error) = composition.draw_overlay(window, &overlay_scene) {
+    } else if let Err(error) = composition.draw_overlay(window, &overlay_scene, overlay_input) {
         log::error!("drawing the X11 composition overlay window: {error:#}");
     }
     drop(composition);
@@ -1194,83 +1168,52 @@ pub(crate) fn set_composition_order(
     composition
         .occluders
         .retain(|id, _| surfaces.iter().any(|surface| surface.id == *id));
-    composition.apply_order()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::scene_occluders;
-    use gpui::{
-        Bounds, ContentMask, DevicePixels, Quad, ScaledPixels, Scene, Shadow, black, point, size,
-    };
-
-    fn quad(bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>) -> Quad {
-        Quad {
-            bounds,
-            content_mask: ContentMask { bounds: mask },
-            ..Default::default()
+    composition.apply_order()?;
+    let inputs = surfaces
+        .iter()
+        .filter(|surface| match &surface.content {
+            PlatformCompositionSurfaceContent::Native(attachment)
+            | PlatformCompositionSurfaceContent::ExternalGpu(attachment) => {
+                attachment.input_forwarding()
+            }
+            PlatformCompositionSurfaceContent::Gpui => false,
+        })
+        .map(|surface| {
+            let attachment = match &surface.content {
+                PlatformCompositionSurfaceContent::Native(attachment)
+                | PlatformCompositionSurfaceContent::ExternalGpu(attachment) => attachment,
+                PlatformCompositionSurfaceContent::Gpui => {
+                    anyhow::bail!("GPUI surface cannot forward native input")
+                }
+            };
+            let handle = attachment
+                .platform_handle()?
+                .downcast::<rwh::RawWindowHandle>()
+                .map_err(|_| anyhow!("native X11 input surface has no window handle"))?;
+            let id = match *handle {
+                rwh::RawWindowHandle::Xcb(handle) => handle.window.get(),
+                rwh::RawWindowHandle::Xlib(handle) => u32::try_from(handle.window)?,
+                _ => anyhow::bail!("native input surface requires an X11 window"),
+            };
+            anyhow::ensure!(id != 0, "native X11 input window is null");
+            Ok((
+                id,
+                InputWindow {
+                    window: window.0.clone(),
+                    native: Some(Rc::downgrade(attachment)),
+                },
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    INPUT_WINDOWS.with(|windows| {
+        let mut windows = windows.borrow_mut();
+        for id in composition.input_windows.drain(..) {
+            windows.remove(&id);
         }
-    }
-
-    fn scaled(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
-        Bounds::new(
-            point(ScaledPixels(x), ScaledPixels(y)),
-            size(ScaledPixels(width), ScaledPixels(height)),
-        )
-    }
-
-    fn device(x: i32, y: i32, width: i32, height: i32) -> Bounds<DevicePixels> {
-        Bounds::new(
-            point(DevicePixels(x), DevicePixels(y)),
-            size(DevicePixels(width), DevicePixels(height)),
-        )
-    }
-
-    #[test]
-    fn scene_occluders_skip_shadows_and_covered_rectangles() {
-        let everything = scaled(0., 0., 1000., 1000.);
-        let mut scene = Scene::default();
-        scene.insert_primitive(Shadow {
-            order: 0,
-            blur_radius: ScaledPixels(24.),
-            bounds: scaled(500., 500., 100., 100.),
-            corner_radii: Default::default(),
-            content_mask: ContentMask { bounds: everything },
-            color: Default::default(),
-            element_bounds: scaled(500., 500., 100., 100.),
-            element_corner_radii: Default::default(),
-            inset: 0,
-            pad: 0,
-        });
-        scene.insert_primitive(quad(scaled(10., 10., 100., 50.), everything));
-        scene.insert_primitive(quad(scaled(20.5, 20.5, 10., 10.), everything));
-        scene.insert_primitive(quad(
-            scaled(200., 0., 100., 100.),
-            scaled(250., 0., 20., 40.),
-        ));
-        scene.finish();
-
-        let mut occluders = scene_occluders(&scene, false);
-        occluders.sort_by_key(|bounds| bounds.origin.x);
-        assert_eq!(occluders, [device(10, 10, 100, 50), device(250, 0, 20, 40)]);
-    }
-
-    #[test]
-    fn opaque_scene_occluders_skip_translucent_backgrounds() {
-        let everything = scaled(0., 0., 1000., 1000.);
-        let mut scene = Scene::default();
-        // A dialog's translucent backdrop over the whole window, and its panel.
-        scene.insert_primitive(Quad {
-            background: black().opacity(0.4).into(),
-            ..quad(everything, everything)
-        });
-        scene.insert_primitive(Quad {
-            background: black().into(),
-            ..quad(scaled(300., 200., 400., 300.), everything)
-        });
-        scene.finish();
-
-        assert_eq!(scene_occluders(&scene, true), [device(300, 200, 400, 300)]);
-        assert_eq!(scene_occluders(&scene, false), [device(0, 0, 1000, 1000)]);
-    }
+        for (id, input) in inputs {
+            windows.insert(id, input);
+            composition.input_windows.push(id);
+        }
+    });
+    Ok(())
 }

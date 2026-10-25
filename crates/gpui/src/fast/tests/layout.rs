@@ -374,6 +374,79 @@ fn a_node_adopted_from_another_parent_keeps_its_position() {
     );
 }
 
+/// Lays out a child under one parent, then has another parent take it in
+/// the next frame while the first is kept without being requested. Returns
+/// the engine with the child, the parent it was taken from and the one that
+/// took it.
+fn child_taken_from_a_kept_parent() -> (crate::TaffyLayoutEngine, [crate::LayoutId; 3]) {
+    let mut engine = crate::TaffyLayoutEngine::new();
+    let child = request(&mut engine, 1, &[]);
+    let original = request(&mut engine, 2, &[child]);
+    engine.clear();
+
+    assert_eq!(request(&mut engine, 1, &[]), child);
+    let adopter = request(&mut engine, 3, &[child]);
+    engine.keep_retained(&[2]);
+    engine.clear();
+    assert!(engine.taffy.children(original.into()).unwrap().is_empty());
+    assert_eq!(engine.taffy.parent(child.into()), Some(adopter.into()));
+    (engine, [child, original, adopter])
+}
+
+fn request(
+    engine: &mut crate::TaffyLayoutEngine,
+    key: u64,
+    children: &[crate::LayoutId],
+) -> crate::LayoutId {
+    engine.request_layout(Some(key), crate::Style::default(), px(14.), 1., children)
+}
+
+/// A parent requested again with the child another parent took from it
+/// takes the child back, though it asks for the children it asked for
+/// before, and is left alone once it has it.
+#[test]
+fn a_parent_requested_again_takes_back_a_child_taken_from_it() {
+    let (mut engine, [child, original, adopter]) = child_taken_from_a_kept_parent();
+
+    let writes = engine.retention.stats.children_writes;
+    assert_eq!(request(&mut engine, 1, &[]), child);
+    assert_eq!(request(&mut engine, 2, &[child]), original);
+    engine.clear();
+    assert_eq!(engine.retention.stats.children_writes, writes + 1);
+    assert_eq!(
+        engine.taffy.children(original.into()).unwrap(),
+        [child.into()]
+    );
+    assert!(engine.layout_reaches(original, child));
+    assert!(!engine.layout_reaches(adopter, child));
+
+    let changes = engine.layout_changes();
+    assert_eq!(request(&mut engine, 1, &[]), child);
+    assert_eq!(request(&mut engine, 2, &[child]), original);
+    engine.clear();
+    assert_eq!(engine.retention.stats.children_writes, writes + 1);
+    assert_eq!(engine.layout_changes(), changes);
+}
+
+/// A subtree whose parent lost a child to another parent cannot be kept as
+/// it is, since the parent no longer holds the child it was laid out with.
+/// It is laid out again instead, which gives the child back, and can be
+/// kept from then on.
+#[test]
+fn a_subtree_missing_a_taken_child_is_not_kept() {
+    let (mut engine, [child, original, _]) = child_taken_from_a_kept_parent();
+
+    assert!(!engine.try_keep_retained(&[1, 2]));
+    assert_eq!(request(&mut engine, 1, &[]), child);
+    assert_eq!(request(&mut engine, 2, &[child]), original);
+    engine.clear();
+    assert!(engine.layout_reaches(original, child));
+
+    assert!(engine.try_keep_retained(&[1, 2]));
+    engine.clear();
+    assert!(engine.layout_reaches(original, child));
+}
+
 /// Rows of a uniform list five rows tall, scrolled to `scroll_top`.
 struct ScrolledRows {
     row_ids: Vec<u64>,
@@ -786,4 +859,86 @@ fn a_rebuilt_measured_leaf_measuring_the_same_leaves_its_layout_alone() {
     assert_eq!(probe.get().origin.y, below.origin.y + px(20.));
     let (retained, fresh) = from_scratch(&mut cx);
     assert_eq!(retained, fresh);
+}
+
+/// A message's body, a view of its own inside a list row, as a Markdown
+/// view keeps its parsed text in an entity.
+struct ListRowBody {
+    ix: usize,
+}
+
+impl Render for ListRowBody {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(100.))
+            .child(format!("message {} of the transcript", self.ix))
+    }
+}
+
+/// A transcript: a `list` whose rows each hold a body view.
+struct ListOfViews {
+    list: crate::ListState,
+    bodies: Vec<Entity<ListRowBody>>,
+}
+
+impl Render for ListOfViews {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        crate::list(self.list.clone(), move |ix, _, cx| {
+            let body = view.upgrade().map(|view| view.read(cx).bodies[ix].clone());
+            div().children(body).into_any_element()
+        })
+        .size_full()
+    }
+}
+
+/// Moves `window`'s list to `offset_in_item` down row `item_ix` and returns
+/// the layout work that followed. See [`change_and_draw`].
+fn scroll_list_of_views(
+    cx: &mut TestAppContext,
+    window: WindowHandle<ListOfViews>,
+    item_ix: usize,
+    offset_in_item: Pixels,
+) -> LayoutStats {
+    change_and_draw(cx, window, |view| {
+        view.list.scroll_to(crate::ListOffset {
+            item_ix,
+            offset_in_item,
+        })
+    })
+}
+
+/// A view in a list row that moves is laid out again as the list prepaints
+/// the row, outside the row's own layout, where the nodes it claims were
+/// not taken for the row's: once the row scrolled out they were released,
+/// and dragging a scrollbar back over rows laid out moments before laid
+/// every body out, and shaped its text, afresh. They linger as the row's.
+#[test]
+fn a_moved_view_in_a_list_row_keeps_its_nodes_while_the_row_is_out_of_view() {
+    let mut cx = TestAppContext::single();
+    let window = cx.add_window(|_, cx| ListOfViews {
+        list: crate::ListState::new(40, crate::ListAlignment::Top, px(0.)),
+        bodies: (0..40).map(|ix| cx.new(|_| ListRowBody { ix })).collect(),
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.set_view_retention(true);
+        if crate::fast::layers::COMPILED {
+            window.set_scroll_layers(false);
+        }
+        window.resize(size(px(400.), px(200.)));
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+
+    // Rows 10 to 12 are laid out, then move, so that their bodies are
+    // laid out again where the list prepaints them.
+    scroll_list_of_views(&mut cx, window, 10, px(0.));
+    scroll_list_of_views(&mut cx, window, 10, px(30.));
+    // Far enough for them to go unclaimed, and back.
+    scroll_list_of_views(&mut cx, window, 30, px(0.));
+    let back = scroll_list_of_views(&mut cx, window, 10, px(30.));
+    assert_eq!(
+        back.nodes_created, 0,
+        "rows scrolled back into view should find the nodes they had: {back:?}"
+    );
 }

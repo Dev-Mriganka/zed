@@ -190,7 +190,7 @@ impl LineLayout {
         (left, right)
     }
 
-    fn compute_wrap_boundaries(
+    pub(crate) fn compute_wrap_boundaries(
         &self,
         text: &str,
         wrap_width: Pixels,
@@ -235,7 +235,12 @@ impl LineLayout {
                     last_candidate_x = x;
                 }
             } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
+                // Not between CJK punctuation and the character it belongs
+                // to, see `fast::line_break`.
+                if ch != ' '
+                    && first_non_whitespace_ix.is_some()
+                    && crate::fast::line_break::allows_break_between(prev_ch, ch)
+                {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
                 }

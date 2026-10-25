@@ -123,6 +123,14 @@ pub(crate) fn global_changed(cx: &mut App, global_type: TypeId) {
     cx.dependencies.global_changed(global_type);
 }
 
+/// A count that grows with every entity updated, written or changed and
+/// every global changed: equal counts taken at two moments saw none of
+/// those between them.
+pub(crate) fn change_count(cx: &App) -> u64 {
+    let log = &cx.entities.access_log;
+    log.update_generation + log.write_generation.get() + cx.dependencies.global_generation
+}
+
 /// Stands for whether a global of type `G` is set, which a subtree that
 /// only asked [`App::has_global`] depends on rather than on the global.
 struct GlobalPresence<G>(std::marker::PhantomData<G>);
@@ -253,7 +261,7 @@ impl App {
             offset_reads: crate::fast::layers::invalidate::begin_offset_reads(),
             generation: self.dependencies.global_generation,
             updates: self.entities.access_log.update_generation,
-            writes: self.entities.access_log.write_generation,
+            writes: self.entities.access_log.write_generation.get(),
         }
     }
 
@@ -514,16 +522,42 @@ impl App {
             .entities
             .access_log
             .written_since(&dependencies.entities, &dependencies.writes)
-            || dependencies.globals.iter().any(|global| {
-                self.dependencies
-                    .global_changed_at
-                    .get(global)
-                    .is_some_and(|changed_at| *changed_at > dependencies.generation)
-            })
-            || dependencies
-                .states
-                .iter()
-                .any(|(version, read_at)| version.get() != *read_at)
+            || self.globals_or_states_changed(dependencies)
+    }
+
+    /// Whether anything in `dependencies`, read by a cached view
+    /// ([`crate::Entity::cached`]) or a view drawn inside one, changed in a
+    /// way that draws the cached view again: one of the entities was
+    /// notified, or a global or a versioned state changed.
+    ///
+    /// An entity updated without being notified does not count, whether it
+    /// was updated outside drawing or written while the window drew (see
+    /// [`note_update`]). Upstream builds a cached view again only when it,
+    /// or a view drawn in it, is notified, or it is drawn somewhere else: a
+    /// view around it rendering again, and writing to what it reads as it
+    /// does, as a view handing its child what to show does on every render,
+    /// does not. Such a write is counted for a view that is not cached
+    /// because upstream renders that view again with the view around it, and
+    /// shows what was written; it never shows it in a cached view that was
+    /// not notified. Drawing a cached view again for less than that never
+    /// draws it from older reads than upstream would.
+    pub(crate) fn notified_dependencies_changed(&self, dependencies: &RenderDependencies) -> bool {
+        self.entities
+            .access_log
+            .changed_since(&dependencies.entities, dependencies.updates, false)
+            || self.globals_or_states_changed(dependencies)
+    }
+
+    fn globals_or_states_changed(&self, dependencies: &RenderDependencies) -> bool {
+        dependencies.globals.iter().any(|global| {
+            self.dependencies
+                .global_changed_at
+                .get(global)
+                .is_some_and(|changed_at| *changed_at > dependencies.generation)
+        }) || dependencies
+            .states
+            .iter()
+            .any(|(version, read_at)| version.get() != *read_at)
     }
 }
 
@@ -568,8 +602,10 @@ pub(crate) struct EntityAccessLog {
     /// [`note_update`].
     updated_at: FxHashMap<EntityId, u64>,
     /// Counts the entities updated while a recording is open — written while
-    /// the window draws — each of which is stamped into `written_at`.
-    write_generation: u64,
+    /// the window draws — each of which is stamped into `written_at`. Shared
+    /// with the thread, as the log of entities read is (see
+    /// [`write_generation_now`]).
+    write_generation: Rc<Cell<u64>>,
     /// When each entity was last written while the window drew. See
     /// [`note_update`].
     written_at: FxHashMap<EntityId, u64>,
@@ -607,7 +643,7 @@ impl EntityAccessLog {
     /// Whether any of `entities` was written while the window drew, after
     /// `writes` began and other than by the subtree `writes` belongs to.
     fn written_since(&self, entities: &[EntityId], writes: &Writes) -> bool {
-        self.write_generation != writes.to
+        self.write_generation.get() != writes.to
             && entities.iter().any(|entity| {
                 self.written_at
                     .get(entity)
@@ -632,14 +668,14 @@ impl EntityAccessLog {
 
 impl EntityMap {
     /// Marks where the access log stands as a boundary between stretches.
-    fn mark_access_boundary(&mut self) {
+    pub(crate) fn mark_access_boundary(&mut self) {
         let log = &mut self.access_log;
         log.boundary.set(log.access_log.borrow().len());
     }
 
     /// How many writes were made while the window drew so far.
     pub(crate) fn write_generation(&self) -> u64 {
-        self.access_log.write_generation
+        self.access_log.write_generation.get()
     }
 
     pub fn extend_accessed<'a>(&mut self, entities: impl IntoIterator<Item = &'a EntityId>) {
@@ -753,8 +789,9 @@ pub(crate) fn note_update(entities: &mut EntityMap, entity_id: EntityId) {
         log.updated_at.insert(entity_id, log.update_generation);
         log.updated_unnotified.insert(entity_id);
     } else {
-        log.write_generation += 1;
-        log.written_at.insert(entity_id, log.write_generation);
+        let written_at = log.write_generation.get() + 1;
+        log.write_generation.set(written_at);
+        log.written_at.insert(entity_id, written_at);
     }
 }
 
@@ -796,13 +833,14 @@ pub(crate) struct DependencyRecording {
 /// The writes a recording made itself, from when it began to when it
 /// finished: `(began, finished]` in the write generation.
 fn writes_while_open(recording: &DependencyRecording, log: &EntityAccessLog) -> Writes {
+    let now = log.write_generation.get();
     let mut own = SmallVec::new();
-    if log.write_generation > recording.writes {
-        own.push((recording.writes, log.write_generation));
+    if now > recording.writes {
+        own.push((recording.writes, now));
     }
     Writes {
         from: recording.writes,
-        to: log.write_generation,
+        to: now,
         own,
     }
 }
@@ -853,11 +891,12 @@ impl Writes {
     }
 }
 
-/// The logs of what is read while a recording is open, shared with the
-/// thread, for where they stand to be known where no app is at hand. See
-/// [`read_log_lengths`].
+/// The logs of what is read while a recording is open, and the count of
+/// writes, shared with the thread, for where they stand to be known where no
+/// app is at hand. See [`read_log_lengths`] and [`write_generation_now`].
 struct ReadLogs {
     entities: Rc<RefCell<Vec<EntityId>>>,
+    writes: Rc<Cell<u64>>,
     globals: Rc<RefCell<Vec<TypeId>>>,
     states: Rc<RefCell<Vec<(StateVersion, u64)>>>,
 }
@@ -877,6 +916,7 @@ impl ReadLogs {
             {
                 *logs = Some(ReadLogs {
                     entities: access_log.access_log.clone(),
+                    writes: access_log.write_generation.clone(),
                     globals: dependencies.global_read_log.clone(),
                     states: dependencies.state_read_log.clone(),
                 });
@@ -918,6 +958,13 @@ pub(crate) fn read_log_lengths() -> Option<(usize, usize, usize)> {
             )
         })
     })
+}
+
+/// How many writes were made while the window drew so far (see
+/// [`EntityMap::write_generation`]), from where no app is at hand, as a
+/// `list` drawing a row asks.
+pub(crate) fn write_generation_now() -> u64 {
+    READ_LOGS.with_borrow(|logs| logs.as_ref().map_or(0, |logs| logs.writes.get()))
 }
 
 /// What a recording saw: everything read while it was open, and what was read

@@ -157,6 +157,7 @@ struct InstanceBindings {
 }
 
 pub(crate) struct WgpuBindGroupLayouts {
+    pub(crate) fast_rounded_clip: crate::fast::rounded_clip::Bindings,
     pub(crate) globals: wgpu::BindGroupLayout,
     pub(crate) instances: wgpu::BindGroupLayout,
     pub(crate) texture: wgpu::BindGroupLayout,
@@ -389,7 +390,13 @@ impl WgpuRenderer {
             .iter()
             .find(|f| surface_caps.formats.contains(f))
             .copied()
-            .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+            .or_else(|| {
+                surface_caps
+                    .formats
+                    .iter()
+                    .find(|format| !format.has_srgb_suffix())
+                    .copied()
+            })
             .or_else(|| surface_caps.formats.first().copied())
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -448,6 +455,7 @@ impl WgpuRenderer {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
             present_mode: config
@@ -610,6 +618,7 @@ impl WgpuRendererCore {
         });
 
         WgpuBindGroupLayouts {
+            fast_rounded_clip: crate::fast::rounded_clip::Bindings::new(device),
             globals,
             instances,
             texture,
@@ -617,7 +626,7 @@ impl WgpuRendererCore {
         }
     }
 
-    fn create_instance_texture(
+    pub(crate) fn create_instance_texture(
         device: &wgpu::Device,
         requested_capacity: u64,
         max_texture_dimension: u32,
@@ -694,13 +703,13 @@ impl WgpuRendererCore {
         };
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpui_shaders"),
-            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+            source: crate::fast::rounded_clip::shader_source(shader_source),
         });
 
         let subpixel_shader_module = if dual_source_blending {
             Some(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("gpui_subpixel_shaders"),
-                source: wgpu::ShaderSource::Wgsl(SUBPIXEL_SHADERS.into()),
+                source: crate::fast::rounded_clip::shader_source(SUBPIXEL_SHADERS),
             }))
         } else {
             None
@@ -731,6 +740,7 @@ impl WgpuRendererCore {
                                module: &wgpu::ShaderModule| {
             let mut bind_group_layouts = vec![Some(globals_layout), Some(data_layout)];
             bind_group_layouts.extend(texture_layout.map(Some));
+            crate::fast::rounded_clip::pipeline_layouts(&mut bind_group_layouts, layouts);
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{name}_layout")),
                 bind_group_layouts: &bind_group_layouts,
@@ -815,19 +825,6 @@ impl WgpuRendererCore {
             &shader_module,
         );
 
-        let paths_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-
         let paths = create_pipeline(
             "paths",
             "vs_path",
@@ -838,7 +835,7 @@ impl WgpuRendererCore {
             wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(wgpu::ColorTargetState {
                 format: surface_format,
-                blend: Some(paths_blend),
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
             1,
@@ -1211,7 +1208,7 @@ impl WgpuRenderer {
             return false;
         }
 
-        frame.present();
+        core.resources.queue.present(frame);
         true
     }
 }
@@ -1739,6 +1736,7 @@ impl WgpuRendererCore {
             return;
         }
         pass.set_pipeline(pipeline);
+        crate::fast::rounded_clip::bind_unmasked(pass, self.resources());
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.draw(
@@ -1765,6 +1763,7 @@ impl WgpuRendererCore {
             return Ok(());
         };
         pass.set_pipeline(pipeline);
+        crate::fast::rounded_clip::bind_unmasked(pass, resources);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &sprite_instances.bind_group, &[]);
         pass.set_bind_group(2, &texture.bind_group, &[]);
@@ -1819,6 +1818,7 @@ impl WgpuRendererCore {
         );
         let resources = self.resources();
         pass.set_pipeline(&resources.pipelines.paths);
+        crate::fast::rounded_clip::bind_unmasked(pass, resources);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
@@ -1884,6 +1884,7 @@ impl WgpuRendererCore {
             });
 
             pass.set_pipeline(&resources.pipelines.path_rasterization);
+            crate::fast::rounded_clip::bind_unmasked(&mut pass, resources);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
             // The path rasterization shader loads records by vertex index
@@ -1972,7 +1973,7 @@ impl WgpuRendererCore {
         })
     }
 
-    fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
+    pub(crate) fn write_instance_texture(resources: &WgpuResources, offset: u64, data: &[u8]) {
         let InstanceData::Texture {
             texture,
             width,
@@ -2304,7 +2305,7 @@ impl HeadlessRenderTarget {
 ))]
 pub struct WgpuHeadlessRenderer {
     context: WgpuContext,
-    core: WgpuRendererCore,
+    pub(crate) core: WgpuRendererCore,
     render_target: Option<HeadlessRenderTarget>,
     observed_error_generation: u64,
 }
@@ -2494,7 +2495,7 @@ impl WgpuHeadlessRenderer {
             .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
         self.check_gpu_errors()?;
 
-        let mapped_data = readback_buffer.slice(..).get_mapped_range();
+        let mapped_data = readback_buffer.slice(..).get_mapped_range()?;
         let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
             .map_err(|_| anyhow::anyhow!("Headless image size exceeds addressable memory"))?;
         let mut pixels = Vec::with_capacity(pixel_capacity);

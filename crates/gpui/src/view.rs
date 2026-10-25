@@ -5,7 +5,10 @@ use crate::{
 };
 use crate::{Empty, Window};
 use anyhow::Result;
-use std::{any::TypeId, fmt};
+use std::{
+    any::{TypeId, type_name},
+    fmt,
+};
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
 ///
@@ -16,6 +19,7 @@ use std::{any::TypeId, fmt};
 pub struct AnyView {
     entity: AnyEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
+    pub(crate) view_type_name: &'static str,
 }
 
 impl<V: Render> From<Entity<V>> for AnyView {
@@ -23,6 +27,7 @@ impl<V: Render> From<Entity<V>> for AnyView {
         AnyView {
             entity: value.into_any(),
             render: any_view::render::<V>,
+            view_type_name: type_name::<V>(),
         }
     }
 }
@@ -34,7 +39,7 @@ impl AnyView {
     /// [Context::notify] was called on the backing entity since it was rendered
     /// (or [Window::refresh] is called, which ignores caching).
     pub fn cached(self, style: StyleRefinement) -> ViewElement<AnyView> {
-        crate::fast::splice::cached(self.clone(), self, style)
+        self.into_element().cached(style)
     }
 
     /// Convert this to a weak handle.
@@ -42,6 +47,7 @@ impl AnyView {
         AnyWeakView {
             entity: self.entity.downgrade(),
             render: self.render,
+            view_type_name: self.view_type_name,
         }
     }
 
@@ -53,6 +59,7 @@ impl AnyView {
             Err(entity) => Err(Self {
                 entity,
                 render: self.render,
+                view_type_name: self.view_type_name,
             }),
         }
     }
@@ -84,8 +91,16 @@ impl View for AnyView {
         Some(self.entity.entity_id())
     }
 
+    #[cfg(not(gpui_hot_reload))]
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         (self.render)(&self, window, cx)
+    }
+
+    // The stored function pointer was captured from the original binary, so it must be looked up
+    // in the jump table to reach the patched render.
+    #[cfg(gpui_hot_reload)]
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        subsecond::HotFn::current(self.render).call((&self, window, cx))
     }
 }
 
@@ -114,6 +129,7 @@ impl IntoElement for AnyView {
 pub struct AnyWeakView {
     entity: AnyWeakEntity,
     render: fn(&AnyView, &mut Window, &mut App) -> AnyElement,
+    view_type_name: &'static str,
 }
 
 impl AnyWeakView {
@@ -123,6 +139,7 @@ impl AnyWeakView {
         Some(AnyView {
             entity,
             render: self.render,
+            view_type_name: self.view_type_name,
         })
     }
 }
@@ -132,6 +149,7 @@ impl<V: 'static + Render> From<WeakEntity<V>> for AnyWeakView {
         AnyWeakView {
             entity: view.into(),
             render: any_view::render::<V>,
+            view_type_name: type_name::<V>(),
         }
     }
 }
@@ -246,6 +264,8 @@ pub struct ViewElement<V: View> {
     pub(crate) entity_id: Option<EntityId>,
     pub(crate) cached_style: Option<StyleRefinement>,
     pub(crate) rebuild: crate::fast::splice::RebuildHandle,
+    #[cfg(feature = "profiler")]
+    pub(crate) view_type_name: &'static str,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -254,11 +274,21 @@ impl<V: View> ViewElement<V> {
     /// Wrap a [`View`] as an element.
     #[track_caller]
     pub fn new(view: V) -> Self {
+        Self::with_type_name(view, type_name::<V>())
+    }
+
+    /// Wraps a view whose draw time profiling attributes to `view_type_name`,
+    /// such as an entity's type rather than [`Entity`]'s.
+    #[track_caller]
+    #[cfg_attr(not(feature = "profiler"), expect(unused_variables))]
+    pub(crate) fn with_type_name(view: V, view_type_name: &'static str) -> Self {
         let entity_id = view.entity_id();
         ViewElement {
             entity_id,
             cached_style: None,
             rebuild: crate::fast::splice::RebuildHandle::default(),
+            #[cfg(feature = "profiler")]
+            view_type_name,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -286,6 +316,24 @@ impl<V: View> IntoElement for ViewElement<V> {
     fn into_element(self) -> Self::Element {
         self
     }
+}
+
+#[cfg(not(gpui_hot_reload))]
+#[inline]
+pub(crate) fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+    view.render(window, cx).into_any_element()
+}
+
+/// Every view and component render passes through this hot-patchable boundary, so the
+/// patched code for that render and everything it calls runs on the next frame.
+#[cfg(gpui_hot_reload)]
+pub(crate) fn render_view<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+    #[inline(never)]
+    fn render_view_impl<V: View>(view: V, window: &mut Window, cx: &mut App) -> AnyElement {
+        view.render(window, cx).into_any_element()
+    }
+
+    subsecond::HotFn::current(render_view_impl::<V>).call((view, window, cx))
 }
 
 impl<V: View> Element for ViewElement<V> {

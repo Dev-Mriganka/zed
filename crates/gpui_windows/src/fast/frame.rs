@@ -18,8 +18,8 @@ use gpui::{Path, PrimitiveBatch, ScaledPixels, Scene};
 use windows::Win32::Graphics::{
     Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP},
     Direct3D11::{
-        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11SamplerState,
-        ID3D11ShaderResourceView,
+        ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView,
+        ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
     },
 };
 
@@ -41,6 +41,7 @@ pub(crate) struct FrameState {
     path_sprites: Vec<PathSprite>,
     /// The scroll layer tiles the frames composite.
     pub(crate) layers: TileCache,
+    pub(crate) rounded_masks: crate::fast::rounded_clip::Masks,
 }
 
 /// The Direct3D objects a scene is drawn with.
@@ -49,9 +50,33 @@ pub(crate) struct Target<'a> {
     pub(crate) device_context: &'a ID3D11DeviceContext,
     pub(crate) atlas: &'a DirectXAtlas,
     pub(crate) globals: &'a DirectXGlobalElements,
-    /// The window's render target and path textures, which the frame's
-    /// paths are drawn through; `None` for targets that never draw paths.
-    pub(crate) resources: Option<&'a DirectXResources>,
+    /// What the frame's paths are drawn through; `None` for targets that
+    /// never draw paths.
+    pub(crate) paths: Option<PathTargets<'a>>,
+}
+
+/// The render target a frame's paths are drawn into and upstream's path
+/// intermediate textures they are rasterized through: the window's, from its
+/// [`DirectXResources`], or ones the layer pixel tests make for their target.
+#[derive(Clone, Copy)]
+pub(crate) struct PathTargets<'a> {
+    pub(crate) render_target_view: &'a Option<ID3D11RenderTargetView>,
+    pub(crate) intermediate_texture: &'a ID3D11Texture2D,
+    pub(crate) intermediate_srv: &'a Option<ID3D11ShaderResourceView>,
+    pub(crate) msaa_texture: &'a ID3D11Texture2D,
+    pub(crate) msaa_view: &'a Option<ID3D11RenderTargetView>,
+}
+
+impl<'a> PathTargets<'a> {
+    pub(crate) fn of(resources: &'a DirectXResources) -> Self {
+        PathTargets {
+            render_target_view: &resources.render_target_view,
+            intermediate_texture: &resources.path_intermediate_texture,
+            intermediate_srv: &resources.path_intermediate_srv,
+            msaa_texture: &resources.path_intermediate_msaa_texture,
+            msaa_view: &resources.path_intermediate_msaa_view,
+        }
+    }
 }
 
 /// Draws `scene`'s batches in place of `DirectXRenderer::render`'s loop, once
@@ -74,7 +99,7 @@ pub(crate) fn draw_batches(renderer: &mut DirectXRenderer, scene: &Scene) -> Res
         device_context: &devices.device_context,
         atlas: &renderer.atlas,
         globals: &renderer.globals,
-        resources: Some(resources),
+        paths: Some(PathTargets::of(resources)),
     };
     draw_scene(
         &target,
@@ -128,28 +153,65 @@ pub(crate) fn draw_scene(
     frame: &mut FrameState,
     scene: &Scene,
 ) -> Result<()> {
+    let result = draw_scene_masked(target, pipelines, frame, scene, None);
+    crate::fast::rounded_clip::bind(target, &mut frame.rounded_masks, None)?;
+    result
+}
+
+pub(crate) fn draw_scene_masked(
+    target: &Target<'_>,
+    pipelines: &mut DirectXRenderPipelines,
+    frame: &mut FrameState,
+    scene: &Scene,
+    mask: Option<&ID3D11ShaderResourceView>,
+) -> Result<()> {
     let batch_params = target
         .globals
         .batch_params_buffer
         .as_ref()
         .context("batch params buffer missing")?;
-    let FrameState {
-        state,
-        path_vertices,
-        path_sprites,
-        layers,
-        ..
-    } = frame;
     let device_context = target.device_context;
-    state.forget();
+    frame.state.forget();
+    let mut restore_upload = false;
 
-    let mut draw = Draw {
-        device_context,
-        state,
-        batch_params,
-        sampler: &target.globals.sampler,
-    };
     for batch in scene.batches() {
+        if let PrimitiveBatch::PolychromeSprites {
+            texture_id,
+            ref range,
+        } = batch
+            && let Some(group) = crate::fast::rounded_clip::group(scene, texture_id)
+        {
+            for index in range.clone() {
+                crate::fast::rounded_clip::draw_group(
+                    target,
+                    pipelines,
+                    frame,
+                    group,
+                    &scene.polychrome_sprites[index],
+                    mask,
+                )?;
+            }
+            restore_upload = true;
+            continue;
+        }
+        if restore_upload {
+            upload(target, pipelines, scene)?;
+            restore_upload = false;
+        }
+        crate::fast::rounded_clip::bind(target, &mut frame.rounded_masks, mask)?;
+        let FrameState {
+            state,
+            path_vertices,
+            path_sprites,
+            layers,
+            ..
+        } = frame;
+        let mut draw = Draw {
+            device_context,
+            state,
+            batch_params,
+            sampler: &target.globals.sampler,
+        };
         match batch {
             PrimitiveBatch::Shadows(range) => {
                 draw.instances(&pipelines.shadow_pipeline, range.start, range.len(), None)
@@ -162,7 +224,7 @@ pub(crate) fn draw_scene(
                 if paths.is_empty() {
                     continue;
                 }
-                let Some(resources) = target.resources else {
+                let Some(targets) = &target.paths else {
                     // Layer tiles never hold paths (spec §5.6).
                     debug_assert!(false, "paths drawn into a target without path textures");
                     continue;
@@ -170,7 +232,7 @@ pub(crate) fn draw_scene(
                 rasterize_paths(
                     &mut draw,
                     target.device,
-                    resources,
+                    targets,
                     &mut pipelines.path_rasterization_pipeline,
                     path_vertices,
                     paths,
@@ -179,7 +241,7 @@ pub(crate) fn draw_scene(
                     composite_paths(
                         &mut draw,
                         target.device,
-                        resources,
+                        targets,
                         &mut pipelines.path_sprite_pipeline,
                         path_sprites,
                         paths,
@@ -284,21 +346,15 @@ impl Draw<'_> {
 fn rasterize_paths(
     draw: &mut Draw<'_>,
     device: &ID3D11Device,
-    resources: &DirectXResources,
+    targets: &PathTargets<'_>,
     pipeline: &mut PipelineState<PathRasterizationSprite>,
     vertices: &mut Vec<PathRasterizationSprite>,
     paths: &[Path<ScaledPixels>],
 ) -> Result<()> {
     let context = draw.device_context;
     unsafe {
-        context.ClearRenderTargetView(
-            resources.path_intermediate_msaa_view.as_ref().unwrap(),
-            &[0.0; 4],
-        );
-        context.OMSetRenderTargets(
-            Some(slice::from_ref(&resources.path_intermediate_msaa_view)),
-            None,
-        );
+        context.ClearRenderTargetView(targets.msaa_view.as_ref().unwrap(), &[0.0; 4]);
+        context.OMSetRenderTargets(Some(slice::from_ref(targets.msaa_view)), None);
     }
     draw.state.forget_views();
 
@@ -318,13 +374,13 @@ fn rasterize_paths(
     unsafe {
         context.DrawInstanced(vertices.len() as u32, 1, 0, 0);
         context.ResolveSubresource(
-            &resources.path_intermediate_texture,
+            targets.intermediate_texture,
             0,
-            &resources.path_intermediate_msaa_texture,
+            targets.msaa_texture,
             0,
             RENDER_TARGET_FORMAT,
         );
-        context.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        context.OMSetRenderTargets(Some(slice::from_ref(targets.render_target_view)), None);
     }
     draw.state.forget_views();
     Ok(())
@@ -334,7 +390,7 @@ fn rasterize_paths(
 fn composite_paths(
     draw: &mut Draw<'_>,
     device: &ID3D11Device,
-    resources: &DirectXResources,
+    targets: &PathTargets<'_>,
     pipeline: &mut PipelineState<PathSprite>,
     sprites: &mut Vec<PathSprite>,
     paths: &[Path<ScaledPixels>],
@@ -364,7 +420,7 @@ fn composite_paths(
     draw.state
         .set_pipeline(context, pipeline, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     draw.state
-        .set_texture(context, &resources.path_intermediate_srv, draw.sampler);
+        .set_texture(context, targets.intermediate_srv, draw.sampler);
     unsafe { context.DrawInstanced(4, sprites.len() as u32, 0, 0) };
     Ok(())
 }

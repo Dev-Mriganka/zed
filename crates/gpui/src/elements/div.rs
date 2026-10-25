@@ -4263,12 +4263,12 @@ impl ScrollAnchor {
 
 #[derive(Default, Debug)]
 pub(crate) struct ScrollHandleState {
-    offset: Rc<RefCell<Point<Pixels>>>,
+    pub(crate) offset: Rc<RefCell<Point<Pixels>>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
-    max_offset: Point<Pixels>,
+    pub(crate) max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
-    scroll_to_bottom: bool,
+    pub(crate) scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
     pub(crate) version: crate::fast::dependencies::StateVersion,
@@ -4443,7 +4443,7 @@ impl ScrollHandle {
     /// Scrolls to the bottom.
     pub fn scroll_to_bottom(&self) {
         let mut state = self.0.borrow_mut();
-        crate::fast::dependencies::StateVersion::bump(&state.version);
+        crate::fast::layers::scroll_to_bottom::note_scroll_to_bottom(self, &state);
         state.scroll_to_bottom = true;
     }
 
@@ -5305,6 +5305,96 @@ mod tests {
             1,
             "mouse down over an active prompt should not fire mouse-down-out listeners"
         );
+    }
+
+    #[test]
+    fn touch_tap_out_fires_once_after_release() {
+        let mut test_app = TestAppContext::single();
+        let mouse_down_out_count = Rc::new(RefCell::new(0));
+        let window = test_app.add_window({
+            let mouse_down_out_count = mouse_down_out_count.clone();
+            move |_, _| MouseDownOutOwner {
+                mouse_down_out_count,
+            }
+        });
+        let any_window: AnyWindowHandle = window.into();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let started = TouchEvent {
+                    id: TouchId(1),
+                    phase: TouchPhase::Started,
+                    position: point(px(75.), px(75.)),
+                    force: None,
+                    predicted_position: None,
+                };
+                window.dispatch_event(started.clone().to_platform_input(), cx);
+                assert_eq!(*mouse_down_out_count.borrow(), 0);
+                window.dispatch_event(
+                    TouchEvent {
+                        phase: TouchPhase::Ended,
+                        ..started
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(
+            *mouse_down_out_count.borrow(),
+            1,
+            "a touch tap outside the element should use mouse-down-out listeners"
+        );
+    }
+
+    #[crate::test]
+    fn touch_pan_and_cancel_do_not_fire_mouse_down_out(cx: &mut TestAppContext) {
+        let mouse_down_out_count = Rc::new(RefCell::new(0));
+        let window = cx.add_window({
+            let mouse_down_out_count = mouse_down_out_count.clone();
+            move |_, _| MouseDownOutOwner {
+                mouse_down_out_count,
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            for (id, samples) in [
+                (
+                    TouchId(1),
+                    [
+                        (TouchPhase::Started, 100.),
+                        (TouchPhase::Moved, 75.),
+                        (TouchPhase::Ended, 75.),
+                    ],
+                ),
+                (
+                    TouchId(2),
+                    [
+                        (TouchPhase::Started, 100.),
+                        (TouchPhase::Moved, 100.),
+                        (TouchPhase::Cancelled, 100.),
+                    ],
+                ),
+            ] {
+                for (phase, vertical_position) in samples {
+                    window.dispatch_event(
+                        TouchEvent {
+                            id,
+                            phase,
+                            position: point(px(75.), px(vertical_position)),
+                            predicted_position: None,
+                            force: None,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                }
+            }
+        })
+        .unwrap();
+        assert_eq!(*mouse_down_out_count.borrow(), 0);
     }
 
     #[test]

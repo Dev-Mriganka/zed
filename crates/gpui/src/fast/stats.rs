@@ -1,7 +1,8 @@
 //! `LayoutStats`: counters and timings describing the work a frame did, for benchmarks and profiling.
 
 use crate::{TaffyLayoutEngine, Window};
-use std::time::{Duration, Instant};
+use scheduler::Instant;
+use std::time::Duration;
 
 /// Counters describing the work the layout engine performed, for benchmarking
 /// and profiling.
