@@ -39,6 +39,7 @@ fn wheel(cx: &mut TestAppContext, window: AnyWindowHandle, dy: f32) {
                 delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                 modifiers: Default::default(),
                 touch_phase: TouchPhase::Moved,
+                source: crate::ScrollSource::Pointer,
             }),
             cx,
         );
@@ -3708,6 +3709,7 @@ mod animation {
                     delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(dy))),
                     modifiers: Default::default(),
                     touch_phase: crate::TouchPhase::Moved,
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );
@@ -4191,6 +4193,7 @@ mod layout_states {
                     delta,
                     modifiers: Default::default(),
                     touch_phase: TouchPhase::Moved,
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );

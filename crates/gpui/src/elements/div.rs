@@ -3769,6 +3769,10 @@ pub(crate) enum ActiveTooltip {
         tooltip: AnyTooltip,
         _task: Task<()>,
     },
+    /// Ghostex: the trigger was pressed, so no tooltip shows until the pointer leaves it. A press
+    /// that opens a window or a menu leaves the pointer where it was, and the next small move
+    /// would otherwise bring the tooltip back over what the press opened.
+    Dismissed,
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -3776,7 +3780,7 @@ pub(crate) fn clear_active_tooltip(
     window: &mut Window,
 ) {
     match active_tooltip.borrow_mut().take() {
-        None => {}
+        None | Some(ActiveTooltip::Dismissed) => {}
         Some(ActiveTooltip::WaitingForShow { .. }) => {}
         Some(ActiveTooltip::Visible { .. }) => window.refresh(),
         Some(ActiveTooltip::WaitingForHide { .. }) => window.refresh(),
@@ -3788,7 +3792,7 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
     window: &mut Window,
 ) {
     let should_clear = match active_tooltip.borrow().as_ref() {
-        None => false,
+        None | Some(ActiveTooltip::Dismissed) => false,
         Some(ActiveTooltip::WaitingForShow { .. }) => false,
         Some(ActiveTooltip::Visible { is_hoverable, .. }) => !is_hoverable,
         Some(ActiveTooltip::WaitingForHide { .. }) => false,
@@ -3804,7 +3808,7 @@ pub(crate) fn set_tooltip_on_window(
     window: &mut Window,
 ) -> Option<TooltipId> {
     let tooltip = match active_tooltip.borrow().as_ref() {
-        None => return None,
+        None | Some(ActiveTooltip::Dismissed) => return None,
         Some(ActiveTooltip::WaitingForShow { .. }) => return None,
         Some(ActiveTooltip::Visible { tooltip, .. }) => tooltip.clone(),
         Some(ActiveTooltip::WaitingForHide { tooltip, .. }) => tooltip.clone(),
@@ -3848,16 +3852,34 @@ pub(crate) fn register_tooltip_mouse_handlers(
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
-        move |_: &MouseDownEvent, _phase, window: &mut Window, _cx| {
-            if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
-                clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
+        let check_is_hovered = check_is_hovered.clone();
+        move |_: &MouseDownEvent, phase, window: &mut Window, _cx| {
+            if tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
+                return;
             }
+            // The capture phase runs even when the trigger's own handler stops the press from
+            // bubbling, and it also stops a tooltip still waiting to show.
+            if phase.capture() && check_is_hovered(window) {
+                let shown = matches!(
+                    active_tooltip.borrow().as_ref(),
+                    Some(ActiveTooltip::Visible { .. } | ActiveTooltip::WaitingForHide { .. })
+                );
+                active_tooltip
+                    .borrow_mut()
+                    .replace(ActiveTooltip::Dismissed);
+                if shown {
+                    window.refresh();
+                }
+                return;
+            }
+            clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
         }
     });
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
         let build_tooltip = build_tooltip.clone();
+        let check_is_hovered = check_is_hovered.clone();
         let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
         move |event: &LongPressEvent, phase, window, cx| {
             if !phase.bubble() {
@@ -3901,6 +3923,134 @@ pub(crate) fn register_tooltip_mouse_handlers(
             }
         }
     });
+
+    // Not a mouse event: `Window::flash_hovered_tooltip` walks the frame's mouse listeners with
+    // this request, so the flash reaches exactly the triggers painted this frame, cached views
+    // included, and the topmost hovered one claims it.
+    window.next_frame.mouse_listeners.push(Some(Box::new({
+        let active_tooltip = active_tooltip.clone();
+        move |event: &dyn Any, phase: DispatchPhase, window: &mut Window, cx: &mut App| {
+            let Some(request) = event.downcast_ref::<TooltipFlashRequest>() else {
+                return;
+            };
+            if phase.bubble()
+                && !request.claimed.get()
+                && !window.last_input_was_keyboard()
+                && check_is_hovered(window)
+            {
+                request.claimed.set(true);
+                show_tooltip_flash(
+                    &active_tooltip,
+                    request,
+                    &build_tooltip,
+                    &check_is_hovered_during_prepaint,
+                    window,
+                    cx,
+                );
+            }
+        }
+    })));
+}
+
+/// Handed to every tooltip trigger painted in the current frame by
+/// [`Window::flash_hovered_tooltip`].
+pub(crate) struct TooltipFlashRequest {
+    pub(crate) build: Rc<dyn Fn(&mut Window, &mut App) -> AnyView>,
+    pub(crate) duration: Duration,
+    pub(crate) claimed: Cell<bool>,
+}
+
+/// Shows the flash view in place of the trigger's own tooltip at once, then puts the trigger's
+/// tooltip back if the pointer is still on the trigger, or hides it.
+fn show_tooltip_flash(
+    active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    request: &TooltipFlashRequest,
+    build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
+    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let flash_view = (request.build)(window, cx);
+    let flash_view_id = flash_view.entity_id();
+    *active_tooltip.borrow_mut() = Some(visible_tooltip(
+        active_tooltip,
+        flash_view,
+        false,
+        check_is_hovered_during_prepaint,
+        window,
+    ));
+    window.refresh();
+
+    let duration = request.duration;
+    let weak_active_tooltip = Rc::downgrade(active_tooltip);
+    let build_tooltip = build_tooltip.clone();
+    let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+    window
+        .spawn(cx, async move |cx| {
+            cx.background_executor().timer(duration).await;
+            let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
+                return;
+            };
+            cx.update(|window, cx| {
+                // A press, a scroll, or leaving the trigger already replaced or cleared it.
+                let still_flashing = matches!(
+                    active_tooltip.borrow().as_ref(),
+                    Some(ActiveTooltip::Visible { tooltip, .. })
+                        if tooltip.view.entity_id() == flash_view_id
+                );
+                if !still_flashing {
+                    return;
+                }
+                let restored = if check_is_hovered_during_prepaint(window) {
+                    build_tooltip(window, cx).map(|(view, is_hoverable)| {
+                        visible_tooltip(
+                            &active_tooltip,
+                            view,
+                            is_hoverable,
+                            &check_is_hovered_during_prepaint,
+                            window,
+                        )
+                    })
+                } else {
+                    None
+                };
+                *active_tooltip.borrow_mut() = restored;
+                window.refresh();
+            })
+            .ok();
+        })
+        .detach();
+}
+
+fn visible_tooltip(
+    active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    view: AnyView,
+    is_hoverable: bool,
+    check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    window: &Window,
+) -> ActiveTooltip {
+    let weak_active_tooltip = Rc::downgrade(active_tooltip);
+    let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
+    ActiveTooltip::Visible {
+        tooltip: AnyTooltip {
+            view,
+            mouse_position: window.mouse_position(),
+            check_visible_and_update: Rc::new(move |tooltip_bounds, window, cx| {
+                let Some(active_tooltip) = weak_active_tooltip.upgrade() else {
+                    return false;
+                };
+                handle_tooltip_check_visible_and_update(
+                    &active_tooltip,
+                    is_hoverable,
+                    &check_is_hovered_during_prepaint,
+                    tooltip_bounds,
+                    window,
+                    cx,
+                )
+            }),
+        },
+        is_hoverable,
+    }
 }
 
 /// Handles displaying tooltips when an element is hovered.
@@ -3938,13 +4088,13 @@ fn handle_tooltip_mouse_move(
     let action = match active_tooltip.borrow().as_ref() {
         None => {
             let is_hovered = check_is_hovered(window);
-            if is_hovered && phase.bubble() {
+            if is_hovered && phase.bubble() && !window.tooltips_suppressed() {
                 Action::ScheduleShow
             } else {
                 Action::None
             }
         }
-        Some(ActiveTooltip::WaitingForShow { .. }) => {
+        Some(ActiveTooltip::WaitingForShow { .. }) | Some(ActiveTooltip::Dismissed) => {
             let is_hovered = check_is_hovered(window);
             if is_hovered {
                 Action::None
@@ -4022,6 +4172,11 @@ fn show_tooltip(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
+    // A menu opened while this show was pending (a right press on the trigger) owns the window.
+    if window.tooltips_suppressed() {
+        active_tooltip.borrow_mut().take();
+        return false;
+    }
     let new_tooltip = build_tooltip(window, cx).map(|(view, tooltip_is_hoverable)| {
         let weak_active_tooltip = Rc::downgrade(active_tooltip);
         let check_is_hovered_during_prepaint = check_is_hovered_during_prepaint.clone();
@@ -4099,7 +4254,9 @@ fn handle_tooltip_check_visible_and_update(
                 Action::None
             }
         }
-        None | Some(ActiveTooltip::WaitingForShow { .. }) => Action::None,
+        None | Some(ActiveTooltip::WaitingForShow { .. }) | Some(ActiveTooltip::Dismissed) => {
+            Action::None
+        }
     };
 
     match action {
@@ -5055,6 +5212,7 @@ mod tests {
                         position: touch_position,
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5081,6 +5239,7 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5102,6 +5261,7 @@ mod tests {
                         position: moved_position,
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,
@@ -5387,6 +5547,7 @@ mod tests {
                     position: point(px(75.), px(75.)),
                     force: None,
                     predicted_position: None,
+                    timestamp: None,
                 };
                 window.dispatch_event(started.clone().to_platform_input(), cx);
                 assert_eq!(*mouse_down_out_count.borrow(), 0);
@@ -5445,6 +5606,7 @@ mod tests {
                             position: point(px(75.), px(vertical_position)),
                             predicted_position: None,
                             force: None,
+                            timestamp: None,
                         }
                         .to_platform_input(),
                         cx,

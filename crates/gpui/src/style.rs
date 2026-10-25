@@ -457,6 +457,9 @@ pub struct TextStyle {
     /// The font weight, e.g. bold
     pub font_weight: FontWeight,
 
+    /// Whether the platform may thicken glyph strokes for font smoothing.
+    pub font_smoothing: bool,
+
     /// The font style, e.g. italic
     pub font_style: FontStyle,
 
@@ -493,6 +496,7 @@ impl Default for TextStyle {
             font_size: rems(1.).into(),
             line_height: phi(),
             font_weight: FontWeight::default(),
+            font_smoothing: true,
             font_style: FontStyle::default(),
             background_color: None,
             underline: None,

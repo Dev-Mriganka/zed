@@ -75,6 +75,8 @@ pub(crate) struct StateInner {
     item_measurement_ready: Option<Box<dyn Fn(usize, &App) -> bool>>,
     pub(crate) follow_state: FollowState,
     pub(crate) version: crate::fast::dependencies::StateVersion,
+    /// The items the last layout measured; see [`ListState::last_measured_range`].
+    last_measured_range: Range<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +330,7 @@ impl ListState {
             item_measurement_ready: None,
             follow_state: FollowState::default(),
             version: crate::fast::dependencies::StateVersion::default(),
+            last_measured_range: 0..0,
         })));
         state.splice(0..0, item_count);
         state
@@ -465,6 +468,16 @@ impl ListState {
         };
         state.items = new_items;
         state.measuring_behavior.reset();
+    }
+
+    /// The items the last layout measured: those in view and those in the overdraw around them.
+    ///
+    /// The layout renders an item in the overdraw only when it has no measured size yet, so an item
+    /// in this range that a frame did not render keeps the size (and the content) it was last
+    /// rendered with. A caller that tracks what its rendered items asked for can use this to tell
+    /// an item the list is still holding from one that left it.
+    pub fn last_measured_range(&self) -> Range<usize> {
+        self.0.borrow().last_measured_range.clone()
     }
 
     /// The number of items in this list.
@@ -866,12 +879,17 @@ impl ListState {
 }
 
 impl StateInner {
+    /// The furthest the list scrolls, measured the way `scroll` and `set_offset_from_scrollbar`
+    /// clamp it: the items plus the list's own vertical padding, less the viewport. Leaving the
+    /// padding out made a padded list report an offset past its maximum whenever it sat at its
+    /// end, which pushed a scrollbar thumb off the end of its track.
     fn max_scroll_offset(&self) -> Pixels {
         let bounds = self.last_layout_bounds.unwrap_or_default();
+        let padding = self.last_padding.unwrap_or_default();
         let height = self
             .scrollbar_drag_start_height
             .unwrap_or_else(|| self.items.summary().height);
-        (height - bounds.size.height).max(px(0.))
+        (height + padding.top + padding.bottom - bounds.size.height).max(px(0.))
     }
 
     fn visible_range(
@@ -981,7 +999,8 @@ impl StateInner {
     }
 
     pub(crate) fn fast_scroll_pending(&self) -> bool {
-        self.scroll_anchor.is_some_and(|anchor| anchor.pending.is_some())
+        self.scroll_anchor
+            .is_some_and(|anchor| anchor.pending.is_some())
     }
 
     fn is_provisional(&self) -> bool {
@@ -1128,8 +1147,7 @@ impl StateInner {
                         &self.version,
                         item_index,
                         true,
-                    ))
-            {
+                    )) {
                 (size, self.is_item_ready(item_index, cx))
             } else {
                 let mut element = render_item(item_index, window, cx);
@@ -1278,6 +1296,7 @@ impl StateInner {
         }
 
         let measured_range = cursor.start().0..(cursor.start().0 + measured_items.len());
+        self.last_measured_range = measured_range.clone();
         let mut cursor = old_items.cursor::<Count>(());
         let mut new_items = cursor.slice(&Count(measured_range.start), Bias::Right);
         new_items.extend(measured_items, ());
@@ -2208,6 +2227,43 @@ mod test {
             view.into_any_element()
         });
         assert_eq!(state.max_offset_for_scrollbar().y, px(300.));
+    }
+
+    #[gpui::test]
+    fn test_max_offset_includes_padding(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.)).measure_all();
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+                .pt(px(20.))
+                .pb(px(80.))
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+
+        // 10 items of 50px plus 100px of padding in a 200px viewport: 400px of scrolling, the
+        // same distance `scroll` clamps to.
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(state.max_offset_for_scrollbar().y, px(400.));
+
+        // At the end, the offset the scrollbar reads is exactly that maximum, padding included.
+        state.scroll_to_end();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(-400.));
+        assert_eq!(state.is_scrolled_to_end(), Some(true));
     }
 
     #[gpui::test]

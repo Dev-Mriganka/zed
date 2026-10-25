@@ -1247,6 +1247,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         false
     }
     fn resize(&mut self, size: Size<Pixels>);
+    #[cfg(target_os = "linux")]
+    fn set_x11_frame_in_parent(&mut self, _frame: Bounds<Pixels>) -> bool {
+        false
+    }
     fn scale_factor(&self) -> f32;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
@@ -1278,6 +1282,37 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Rounds the blurred background's corners, for windows whose content is a rounded card.
+    fn set_background_corner_radius(&self, _radius: Pixels) {}
+    /// Ghostex: tunes a blurred background: the blur radius in points (0: no blur; 60 until set)
+    /// of whatever the backend blurs itself (the live blur on macOS, and the desktop picture,
+    /// custom image and video on every platform), and whether the live blur keeps the colour
+    /// saturation the platform material adds (the main window's glass strips it).
+    fn set_background_blur_style(&self, _radius: Pixels, _keep_saturation: bool) {}
+    /// Ghostex: which blur a blurred background uses where the system draws it (Windows).
+    fn set_background_behind_window_blur(&self, _blur: BehindWindowBlur) {}
+    /// Limits a blurred background to these rounded rectangles, in window coordinates, for a
+    /// window whose content is several separate cards; an empty list blurs the whole window.
+    fn set_background_blur_region(&self, _region: Vec<(Bounds<Pixels>, Pixels)>) {}
+    /// Makes a blurred background show the blurred desktop picture instead of blurring every window
+    /// behind this one.
+    fn set_background_wallpaper(&self, _wallpaper: bool) {}
+    /// The picture a wallpaper background shows instead of the desktop picture; `None` goes back to
+    /// the desktop picture.
+    fn set_background_wallpaper_image(&self, _image: Option<std::path::PathBuf>) {}
+    /// Whether a wallpaper background's picture stays still against the screen while the window
+    /// moves (`true`), or is attached to the window and covers it (`false`, the default).
+    fn set_background_wallpaper_follows_screen(&self, _follows_screen: bool) {}
+    /// For a picture attached to the window: the rectangle, in window coordinates, the picture
+    /// covers instead of the window itself; `None` covers the window.
+    fn set_background_wallpaper_cover(&self, _cover: Option<Bounds<Pixels>>) {}
+    /// A looping, muted video a wallpaper background plays, blurred, in place of its picture;
+    /// `None` goes back to the picture. `only_on_power` pauses it while the computer runs on
+    /// battery.
+    fn set_background_video(&self, _video: Option<std::path::PathBuf>, _only_on_power: bool) {}
+    /// An animated backdrop a wallpaper background draws in place of its picture or video; `None`
+    /// goes back to them.
+    fn set_background_live(&self, _live: Option<LiveBackground>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -1300,7 +1335,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// outside of any window update.
     fn on_display_changed(&self, callback: Box<dyn FnMut()>);
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(crate::Point<crate::Pixels>) -> Option<WindowControlArea>>,
+    );
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
@@ -1321,6 +1359,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         _fast_surfaces: &[crate::fast::composition::PlatformCompositionSurface],
     ) -> Result<()> {
         crate::fast::composition::unsupported("surface ordering")
+    }
+
+    /// Whether this backend renders offscreen shader effects. Unsupported
+    /// backends paint their children normally instead of dropping content.
+    #[cfg(target_os = "macos")]
+    fn supports_shader_effects(&self) -> bool {
+        false
     }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
@@ -2611,6 +2656,11 @@ pub struct WindowOptions {
     /// The kind of window to create
     pub kind: WindowKind,
 
+    /// Explicit owner for an X11 transient window, resolved before the window is mapped.
+    /// Other Linux backends ignore this option. None preserves focus-derived ownership.
+    #[cfg(target_os = "linux")]
+    pub x11_parent: Option<AnyWindowHandle>,
+
     /// Whether the window can be moved by the user. When `false`, the user cannot drag
     /// the window (on macOS this sets `NSWindow.isMovable`, which also disables the
     /// Window-menu tiling items); programmatic moves are still allowed.
@@ -2688,6 +2738,11 @@ pub struct WindowParams {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub kind: WindowKind,
 
+    /// Explicit owner for an X11 transient window, resolved before the window is mapped.
+    /// Other Linux backends ignore this option. None preserves focus-derived ownership.
+    #[cfg(target_os = "linux")]
+    pub x11_parent: Option<AnyWindowHandle>,
+
     /// Whether the window should be movable by the user
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub is_movable: bool,
@@ -2727,6 +2782,11 @@ pub struct WindowParams {
     pub app_id: Option<String>,
 
     pub window_min_size: Option<Size<Pixels>>,
+
+    /// The requested background appearance, known before the platform window exists.
+    /// Windows picks its compositing path from it at creation time.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub window_background: WindowBackgroundAppearance,
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
@@ -2782,6 +2842,8 @@ impl Default for WindowOptions {
             focus: true,
             show: true,
             kind: WindowKind::Normal,
+            #[cfg(target_os = "linux")]
+            x11_parent: None,
             is_movable: true,
             app_owns_titlebar_drag: false,
             inactive_frame_interval: Some(Duration::from_micros(33_333)),
@@ -2872,6 +2934,22 @@ pub enum WindowAppearance {
     VibrantDark,
 }
 
+/// Ghostex: an animated backdrop the platform draws behind a wallpaper background in place of a
+/// picture or video: one of the platform's live styles, painted in the given colours.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveBackground {
+    /// The style's id; a style the platform does not draw leaves the live blur.
+    pub style: SharedString,
+    /// The colours it paints with, from the deepest to the brightest, as sRGB components in 0-1.
+    pub colors: [[f32; 3]; 3],
+    /// How fast it moves; 1 is the style's own pace.
+    pub speed: f32,
+    /// How bright it is drawn, 0-1: lower dims it toward its deepest colour.
+    pub brightness: f32,
+    /// Stop moving while the computer runs on battery.
+    pub only_on_power: bool,
+}
+
 /// The appearance of the background of the window itself, when there is
 /// no content or the content is transparent.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -2895,6 +2973,19 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+}
+
+/// Ghostex: how a [`WindowBackgroundAppearance::Blurred`] window blurs the windows and desktop
+/// behind it where the system draws that blur and has no radius to set (Windows).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BehindWindowBlur {
+    /// The system's own blur material (the acrylic on Windows 11), which adds its own frost.
+    #[default]
+    System,
+    /// The same blur without the material's frost, so what is behind keeps its colours.
+    Plain,
+    /// No blur: what is behind shows sharp through the window's own tint.
+    Off,
 }
 
 /// The text rendering mode to use for drawing glyphs.
@@ -3074,6 +3165,14 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// A cursor indicating that clicking will zoom in
+    /// corresponds to the CSS cursor value `zoom-in`
+    ZoomIn,
+
+    /// A cursor indicating that clicking will zoom out
+    /// corresponds to the CSS cursor value `zoom-out`
+    ZoomOut,
 }
 
 /// A clipboard item that should be copied to the clipboard

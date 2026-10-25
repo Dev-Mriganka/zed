@@ -96,7 +96,16 @@ impl WindowsWindowInner {
             // So, let's eagerly activate the window.
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => self.handle_activate_msg(wparam),
+            WM_NCACTIVATE => self.handle_nc_activate_msg(handle, wparam, lparam),
             WM_CREATE => self.handle_create_msg(handle),
+            WM_WINDOWPOSCHANGED => {
+                // Ghostex: a frosted surface's blur windows follow it (`frosted_backdrop.rs`).
+                // `DefWindowProc` still turns this into `WM_MOVE` and `WM_SIZE`.
+                self.state
+                    .frosted_backdrops
+                    .sync(handle, self.state.scale_factor.get());
+                None
+            }
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
@@ -111,13 +120,13 @@ impl WindowsWindowInner {
             WM_CLOSE => self.handle_close_msg(),
             WM_DESTROY => self.handle_destroy_msg(handle),
             WM_MOUSEMOVE => self.handle_mouse_move_msg(handle, lparam, wparam),
-            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(),
+            WM_MOUSELEAVE | WM_NCMOUSELEAVE => self.handle_mouse_leave_msg(handle),
             WM_NCMOUSEMOVE => self.handle_nc_mouse_move_msg(handle, lparam),
             // Treat double click as a second single click, since we track the double clicks ourselves.
             // If you don't interact with any elements, this will fall through to the windows default
             // behavior of toggling whether the window is maximized.
             WM_NCLBUTTONDBLCLK | WM_NCLBUTTONDOWN => {
-                self.handle_nc_mouse_down_msg(handle, MouseButton::Left, wparam, lparam)
+                self.handle_nc_left_button_down_msg(handle, msg, wparam, lparam)
             }
             WM_NCRBUTTONDOWN => {
                 self.handle_nc_mouse_down_msg(handle, MouseButton::Right, wparam, lparam)
@@ -202,6 +211,7 @@ impl WindowsWindowInner {
             callback();
             self.state.callbacks.moved.set(Some(callback));
         }
+        self.refresh_backdrop();
         Some(0)
     }
 
@@ -271,6 +281,9 @@ impl WindowsWindowInner {
                 .store(true, std::sync::atomic::Ordering::Release);
             crate::fast::frame_schedule::FrameRequest::request(&self.state.fast_frame_request);
         }
+        if should_resize_renderer {
+            self.refresh_backdrop();
+        }
         if let Some(mut callback) = self.state.callbacks.resize.take() {
             callback(new_logical_size, scale_factor);
             self.state.callbacks.resize.set(Some(callback));
@@ -326,6 +339,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.frosted_backdrops.clear();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -350,14 +364,10 @@ impl WindowsWindowInner {
         Some(0)
     }
 
+    /// CDXC:PlatformSupport 2026-10-11 WHY:
+    /// Windows sends `WM_MOUSEMOVE` at the unchanged pointer position without the mouse moving (while the user types, for example), and each one restored the cursor GPUI hides on typing and switched the window back to mouse input, which re-hovers everything under the pointer until the next keystroke hides it again; hovering a chat message and typing made its hover background, actions and time blink on every key. A move at the same client position with the same pressed button is not reported again.
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
         self.start_tracking_mouse(handle, TME_LEAVE);
-        self.restore_cursor_after_hide();
-
-        let Some(mut func) = self.state.callbacks.input.take() else {
-            return Some(1);
-        };
-        let scale_factor = self.state.scale_factor.get();
 
         let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
             flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
@@ -371,6 +381,16 @@ impl WindowsWindowInner {
             }
             _ => None,
         };
+        let mouse_move = Some((lparam.0, pressed_button));
+        if self.state.last_mouse_move.replace(mouse_move) == mouse_move {
+            return Some(0);
+        }
+        self.restore_cursor_after_hide();
+
+        let Some(mut func) = self.state.callbacks.input.take() else {
+            return Some(1);
+        };
+        let scale_factor = self.state.scale_factor.get();
         let x = lparam.signed_loword() as f32;
         let y = lparam.signed_hiword() as f32;
         let input = PlatformInput::MouseMove(MouseMoveEvent {
@@ -384,17 +404,57 @@ impl WindowsWindowInner {
         if handled { Some(0) } else { Some(1) }
     }
 
-    fn handle_mouse_leave_msg(&self) -> Option<isize> {
+    /// CDXC:PlatformSupport 2026-09-13 WHY:
+    /// Moving from a GPUI resize rail into a CEF child HWND ends mouse tracking without another GPUI mouse move.
+    /// The window hover flag only redraws; element hover listeners need MouseExited to clear their delayed highlight.
+    fn handle_mouse_leave_msg(&self, handle: HWND) -> Option<isize> {
         self.state.hovered.set(false);
-        // The next window's `WM_SETCURSOR` picks its own cursor, so we just clear
-        // the flag for tight `is_cursor_visible()` semantics.
-        self.state.cursor_visible.store(true, Ordering::Relaxed);
+        self.state.last_mouse_move.set(None);
+        self.restore_cursor_after_hide();
         if let Some(mut callback) = self.state.callbacks.hovered_status_change.take() {
             callback(false);
             self.state
                 .callbacks
                 .hovered_status_change
                 .set(Some(callback));
+        }
+
+        let mut position = POINT::default();
+        unsafe {
+            GetCursorPos(&mut position)
+                .context("unable to get mouse exit position")
+                .log_err()?;
+            ScreenToClient(handle, &mut position)
+                .ok()
+                .context("unable to convert mouse exit position")
+                .log_err()?;
+        }
+        if let Some(mut callback) = self.state.callbacks.input.take() {
+            let pressed_button = [
+                (VK_LBUTTON, MouseButton::Left),
+                (VK_RBUTTON, MouseButton::Right),
+                (VK_MBUTTON, MouseButton::Middle),
+                (
+                    VK_XBUTTON1,
+                    MouseButton::Navigate(NavigationDirection::Back),
+                ),
+                (
+                    VK_XBUTTON2,
+                    MouseButton::Navigate(NavigationDirection::Forward),
+                ),
+            ]
+            .into_iter()
+            .find_map(|(key, button)| is_virtual_key_pressed(key).then_some(button));
+            callback(PlatformInput::MouseExited(MouseExitEvent {
+                position: logical_point(
+                    position.x as f32,
+                    position.y as f32,
+                    self.state.scale_factor.get(),
+                ),
+                pressed_button,
+                modifiers: current_modifiers(),
+            }));
+            self.state.callbacks.input.set(Some(callback));
         }
 
         Some(0)
@@ -787,6 +847,21 @@ impl WindowsWindowInner {
         }
     }
 
+    /// Ghostex: a window on the system acrylic keeps its frame drawn as active when it loses
+    /// focus, so DWM keeps blurring behind it instead of filling it with flat grey
+    /// (`keeps_system_backdrop_when_inactive`). Focus, `WM_ACTIVATE` and the taskbar are unchanged.
+    fn handle_nc_activate_msg(
+        &self,
+        handle: HWND,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if wparam.0 != 0 || !keeps_system_backdrop_when_inactive(&self.state) {
+            return None;
+        }
+        Some(unsafe { DefWindowProcW(handle, WM_NCACTIVATE, WPARAM(1), lparam) }.0)
+    }
+
     fn handle_activate_msg(self: &Rc<Self>, wparam: WPARAM) -> Option<isize> {
         let activated = wparam.loword() > 0;
 
@@ -803,7 +878,7 @@ impl WindowsWindowInner {
         let this = self.clone();
 
         if !activated {
-            this.state.cursor_visible.store(true, Ordering::Relaxed);
+            this.restore_cursor_after_hide();
         }
 
         // When the window is activated (gains focus), reset the modifier tracking state.
@@ -945,6 +1020,8 @@ impl WindowsWindowInner {
         }
         let new_display = WindowsDisplay::new(WindowsDisplay::display_id_for_monitor(new_monitor))?;
         self.set_display(new_display);
+        self.state.display.set(new_display);
+        self.refresh_backdrop();
         Some(0)
     }
 
@@ -961,9 +1038,20 @@ impl WindowsWindowInner {
             return None;
         }
 
+        let mut cursor_point = POINT {
+            x: lparam.signed_loword().into(),
+            y: lparam.signed_hiword().into(),
+        };
+        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
+
         let callback = self.state.callbacks.hit_test_window_control.take();
         let drag_area = if let Some(mut callback) = callback {
-            let area = callback();
+            let scale_factor = self.state.scale_factor.get();
+            let area = callback(logical_point(
+                cursor_point.x as f32,
+                cursor_point.y as f32,
+                scale_factor,
+            ));
             self.state
                 .callbacks
                 .hit_test_window_control
@@ -993,12 +1081,6 @@ impl WindowsWindowInner {
         // We need to calculate the frame thickness ourselves and do the hit test manually.
         let frame_y = get_frame_thicknessx(dpi);
         let frame_x = get_frame_thicknessy(dpi);
-        let mut cursor_point = POINT {
-            x: lparam.signed_loword().into(),
-            y: lparam.signed_hiword().into(),
-        };
-
-        unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
         if self.is_resizable
             && !self.state.is_maximized()
             && 0 <= cursor_point.y
@@ -1094,6 +1176,65 @@ impl WindowsWindowInner {
         }
     }
 
+    /// CDXC:PlatformSupport 2026-10-05 WHY:
+    /// A left press on the caption or a sizing border is answered by `DefWindowProc` with the system move or size loop, which eats the button release: no `WM_NCLBUTTONUP` or `WM_LBUTTONUP` ever arrives. GPUI had already dispatched the press, so anything that began a gesture on it (the window text-selection layer starts a selection on any press that reaches the root) never saw it end, and plain mouse moves afterwards kept extending a selection in the chat transcript. The loop is run here instead, and the release it swallowed is dispatched once it returns. A double click there gets the same release right after `DefWindowProc` maximizes or restores the window, because the resize can leave the pointer outside the window, where its real release is never seen.
+    fn handle_nc_left_button_down_msg(
+        &self,
+        handle: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<isize> {
+        if let Some(result) =
+            self.handle_nc_mouse_down_msg(handle, MouseButton::Left, wparam, lparam)
+        {
+            return Some(result);
+        }
+        if !matches!(
+            wparam.0 as u32,
+            HTCAPTION
+                | HTLEFT
+                | HTRIGHT
+                | HTTOP
+                | HTTOPLEFT
+                | HTTOPRIGHT
+                | HTBOTTOM
+                | HTBOTTOMLEFT
+                | HTBOTTOMRIGHT
+        ) {
+            return None;
+        }
+        unsafe { DefWindowProcW(handle, msg, wparam, lparam) };
+        self.dispatch_swallowed_left_release(handle);
+        Some(0)
+    }
+
+    fn dispatch_swallowed_left_release(&self, handle: HWND) -> Option<()> {
+        let mut position = POINT::default();
+        unsafe {
+            GetCursorPos(&mut position)
+                .context("unable to get mouse position after the move loop")
+                .log_err()?;
+            ScreenToClient(handle, &mut position)
+                .ok()
+                .context("unable to convert mouse position after the move loop")
+                .log_err()?;
+        }
+        let mut func = self.state.callbacks.input.take()?;
+        func(PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: logical_point(
+                position.x as f32,
+                position.y as f32,
+                self.state.scale_factor.get(),
+            ),
+            modifiers: current_modifiers(),
+            click_count: self.state.click_state.current_count.get(),
+        }));
+        self.state.callbacks.input.set(Some(func));
+        Some(())
+    }
+
     fn handle_nc_mouse_up_msg(
         &self,
         handle: HWND,
@@ -1161,15 +1302,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_cursor_changed(&self, lparam: LPARAM) -> Option<isize> {
-        let had_cursor = self.state.current_cursor.get().is_some();
-
         self.state.current_cursor.set(if lparam.0 == 0 {
             None
         } else {
             Some(HCURSOR(lparam.0 as _))
         });
 
-        if had_cursor != self.state.current_cursor.get().is_some() {
+        if self.state.hovered.get() && self.state.cursor_visible.load(Ordering::Relaxed) {
             unsafe { SetCursor(self.state.current_cursor.get()) };
         }
 
@@ -1200,7 +1339,9 @@ impl WindowsWindowInner {
         unsafe {
             SetCursor(cursor);
         };
-        Some(0)
+        // WM_SETCURSOR must return TRUE once handled; FALSE lets default
+        // processing replace this cursor with the window class's cursor.
+        Some(1)
     }
 
     fn handle_system_settings_changed(
@@ -1209,6 +1350,9 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> Option<isize> {
+        if wparam.0 == SPI_SETDESKWALLPAPER.0 as usize {
+            self.backdrop_wallpaper_changed();
+        }
         if wparam.0 != 0 {
             self.state.click_state.system_update(wparam.0);
             self.state.border_offset.update(handle).log_err();
@@ -1428,7 +1572,8 @@ impl WindowsWindowInner {
         }
     }
 
-    /// Clear the hidden flag and restore the cursor immediately
+    /// CDXC:PlatformSupport 2026-09-29 WHY:
+    /// Mouse exit and deactivation must restore the Win32 cursor together with the shared visible flag; clearing only the flag leaves the next mouse move believing an invisible cursor is already visible.
     fn restore_cursor_after_hide(&self) {
         if !self.state.cursor_visible.swap(true, Ordering::Relaxed) {
             unsafe {

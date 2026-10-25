@@ -100,6 +100,28 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     static SIZENWSE: OnceLock<SafeCursor> = OnceLock::new();
     static SIZENESW: OnceLock<SafeCursor> = OnceLock::new();
     static NO: OnceLock<SafeCursor> = OnceLock::new();
+    static GRAB: OnceLock<SafeCursor> = OnceLock::new();
+    static GRABBING: OnceLock<SafeCursor> = OnceLock::new();
+    // Windows ships no grab cursors, so these are Chromium's, the ones browsers show for
+    // `cursor: grab` and `cursor: grabbing` (src/cursors/LICENSE-chromium).
+    let embedded = match style {
+        CursorStyle::OpenHand => Some((&GRAB, &include_bytes!("cursors/hand_grab.cur")[..])),
+        CursorStyle::ClosedHand => {
+            Some((&GRABBING, &include_bytes!("cursors/hand_grabbing.cur")[..]))
+        }
+        _ => None,
+    };
+    if let Some((lock, file)) = embedded {
+        return Some(
+            *(*lock.get_or_init(|| {
+                cursor_from_cur_file(file)
+                    .log_err()
+                    .or_else(|| load_cursor(CursorStyle::Arrow))
+                    .unwrap_or_default()
+                    .into()
+            })),
+        );
+    }
     let (lock, name) = match style {
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
         CursorStyle::Crosshair => (&CROSS, IDC_CROSS),
@@ -128,6 +150,36 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
             .into()
         })),
     )
+}
+
+/// Builds a cursor from the largest image in a `.cur` file. `CreateIconFromResourceEx` takes a
+/// cursor resource, which is that image's DIB preceded by its hotspot as two words.
+fn cursor_from_cur_file(file: &[u8]) -> anyhow::Result<HCURSOR> {
+    let word = |at: usize| {
+        file.get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let dword = |at: usize| {
+        file.get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let count = word(4).context("cursor file header")? as usize;
+    let entry = (0..count)
+        .map(|index| 6 + index * 16)
+        .max_by_key(|&entry| dword(entry + 8).unwrap_or(0))
+        .context("cursor file has no images")?;
+    let hotspot = file.get(entry + 4..entry + 8).context("cursor hotspot")?;
+    let size = dword(entry + 8).context("cursor image size")?;
+    let offset = dword(entry + 12).context("cursor image offset")?;
+    let image = file
+        .get(offset..offset + size)
+        .context("cursor image data")?;
+    let mut resource = Vec::with_capacity(hotspot.len() + image.len());
+    resource.extend_from_slice(hotspot);
+    resource.extend_from_slice(image);
+    let icon =
+        unsafe { CreateIconFromResourceEx(&resource, false, 0x0003_0000, 0, 0, LR_DEFAULTSIZE) }?;
+    Ok(HCURSOR(icon.0))
 }
 
 /// This function is used to configure the dark mode for the window built-in title bar.

@@ -432,6 +432,7 @@ fn scroll_page_frames(cx: &mut TestAppContext, placed: bool) -> u64 {
                         delta: crate::ScrollDelta::Pixels(crate::point(px(0.), px(dy))),
                         modifiers: Default::default(),
                         touch_phase: crate::TouchPhase::Moved,
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );

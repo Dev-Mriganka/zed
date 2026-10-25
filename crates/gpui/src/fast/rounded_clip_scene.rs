@@ -99,6 +99,17 @@ pub(crate) fn compile(scene: &mut Scene) {
                 .insert_primitive(primitive.clone()),
             PaintOperation::StartLayer(bounds) => stack.last_mut().unwrap().push_layer(*bounds),
             PaintOperation::EndLayer => stack.last_mut().unwrap().pop_layer(),
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect {
+                effect,
+                bounds,
+                content_mask,
+            } => stack
+                .last_mut()
+                .unwrap()
+                .push_effect(effect.clone(), *bounds, *content_mask),
+            #[cfg(target_os = "macos")]
+            PaintOperation::EndEffect => stack.last_mut().unwrap().pop_effect(),
         }
     }
     assert!(

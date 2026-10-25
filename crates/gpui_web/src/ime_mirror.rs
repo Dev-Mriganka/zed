@@ -47,6 +47,38 @@ const CONTEXT_CHARS: usize = 512;
 /// element write and therefore an IME restart.
 const MIN_EDGE_CHARS: usize = 64;
 
+/// The attribute on each window's hidden element; its value is the window's id.
+pub(crate) const WINDOW_INPUT_ATTRIBUTE: &str = "data-gpui-window-input";
+
+/// The id of the window whose hidden element has the page's focus: the window that holds the
+/// keyboard, as the key window does on the desktop platforms.
+pub(crate) fn focused_window_input(document: &web_sys::Document) -> Option<u64> {
+    document
+        .active_element()?
+        .get_attribute(WINDOW_INPUT_ATTRIBUTE)?
+        .parse()
+        .ok()
+}
+
+/// Focuses the hidden element of the window opened last, which is the one on top: an overlay
+/// window that closes hands the keyboard back to the window under it.
+pub(crate) fn focus_topmost_window_input(document: &web_sys::Document) {
+    let Ok(elements) = document.query_selector_all(&format!("textarea[{WINDOW_INPUT_ATTRIBUTE}]"))
+    else {
+        return;
+    };
+    let Some(last) = elements
+        .length()
+        .checked_sub(1)
+        .and_then(|index| elements.get(index))
+    else {
+        return;
+    };
+    if let Ok(element) = last.dyn_into::<web_sys::HtmlTextAreaElement>() {
+        ImeMirror::focus_element(&element);
+    }
+}
+
 /// The hidden `<textarea>` IMEs edit, plus the bookkeeping that relates it
 /// to the document.
 ///
@@ -84,10 +116,13 @@ pub(crate) struct ImeMirror {
 }
 
 impl ImeMirror {
+    /// `focus` gives the new element keyboard focus; a window opened with `focus: false` leaves it
+    /// where it is.
     pub(crate) fn new(
         document: &web_sys::Document,
         body: &web_sys::HtmlElement,
         touch_input: bool,
+        focus: bool,
     ) -> anyhow::Result<Self> {
         // A textarea rather than an input: single-line inputs silently strip
         // newlines from assigned values, which would make the mirror text
@@ -108,9 +143,14 @@ impl ImeMirror {
         // whose font is smaller than 16px; with page zoom disabled the user
         // can never zoom back out, so keep the hidden IME input at 16px.
         style.set_property("font-size", "16px").ok();
+        // Marks every window's element, so the keyboard can go back to the window under an overlay
+        // window that closes (see `WebWindow`'s `Drop`).
+        element.set_attribute(WINDOW_INPUT_ATTRIBUTE, "").ok();
         body.append_child(&element)
             .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
-        Self::focus_element(&element);
+        if focus {
+            Self::focus_element(&element);
+        }
         // The element must stay focused to receive hardware-key and IME
         // events, but on touch-first devices a focused *editable* element
         // invites the browser to summon the virtual keyboard on the next
@@ -186,6 +226,13 @@ impl ImeMirror {
         Self::focus_element(&self.element);
     }
 
+    /// Names the window this element belongs to (`focused_window_input`).
+    pub(crate) fn tag_window(&self, window_id: u64) {
+        self.element
+            .set_attribute(WINDOW_INPUT_ATTRIBUTE, &window_id.to_string())
+            .ok();
+    }
+
     fn focus_element(element: &web_sys::HtmlTextAreaElement) {
         // The hidden mirror is not a scroll target: revealing its caret can
         // pan Android Chrome's visual viewport when the keyboard opens.
@@ -236,6 +283,11 @@ impl ImeMirror {
 
     pub(crate) fn selection_start(&self) -> Option<u32> {
         self.element.selection_start().ok().flatten()
+    }
+
+    /// The hidden element that receives this window's keys and text.
+    pub(crate) fn element(&self) -> &web_sys::HtmlTextAreaElement {
+        &self.element
     }
 
     pub(crate) fn element_selection_end(&self) -> Option<u32> {

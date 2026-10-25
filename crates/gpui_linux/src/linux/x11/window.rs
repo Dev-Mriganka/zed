@@ -59,6 +59,7 @@ x11rb::atom_manager! {
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,
         WM_TRANSIENT_FOR,
+        _GPUI_KEYBOARD_FOCUS_WINDOW,
         _NET_WM_PID,
         _NET_WM_NAME,
         _NET_WM_ICON,
@@ -72,6 +73,7 @@ x11rb::atom_manager! {
         _NET_WM_SYNC_REQUEST,
         _NET_WM_SYNC_REQUEST_COUNTER,
         _NET_WM_BYPASS_COMPOSITOR,
+        _KDE_NET_WM_BLUR_BEHIND_REGION,
         _NET_WM_MOVERESIZE,
         _NET_WM_WINDOW_TYPE,
         _NET_WM_WINDOW_TYPE_NOTIFICATION,
@@ -257,7 +259,16 @@ pub struct Callbacks {
 }
 
 pub struct X11WindowState {
+    pub(crate) keyboard_focus_window: xproto::Window,
+    /// `activate` asked the WM for focus while the window did not have it; the keyboard-focus child
+    /// takes focus when the WM grants it.
+    activation_focus_pending: bool,
     parent: Option<X11WindowStatePtr>,
+    #[cfg(target_os = "linux")]
+    explicit_owner: Option<X11WindowStatePtr>,
+    fixed_size: bool,
+    #[cfg(target_os = "linux")]
+    owned_children: FxHashSet<xproto::Window>,
     children: FxHashSet<xproto::Window>,
     client: X11ClientStatePtr,
     executor: ForegroundExecutor,
@@ -273,6 +284,7 @@ pub struct X11WindowState {
     /// outlive the window, which a display mode switch relies on.
     pub(crate) renderer: Option<WgpuRenderer>,
     pub(crate) fast_composition: crate::fast::composition::x11::Composition,
+    glass: crate::linux::glass::Glass,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
@@ -541,17 +553,19 @@ impl X11WindowState {
                     visual.depth,
                     x_window,
                     visual_set.root,
-                    bounds.origin.x.0 + 2,
+                    bounds.origin.x.0,
                     bounds.origin.y.0,
                     bounds.size.width.0,
                     bounds.size.height.0
                 )
             },
+            // CDXC:PlatformSupport 2026-09-29 WHY:
+            // KWin keeps the position a window is created at (with the user-specified position hint below it no longer re-centers it), so the 2px nudge upstream added at creation moved every restored window 2px right on each launch. The nudge stays only in the default-position fallback after the geometry check.
             xcb.create_window(
                 visual.depth,
                 x_window,
                 visual_set.root,
-                (bounds.origin.x.0 + 2) as i16,
+                bounds.origin.x.0 as i16,
                 bounds.origin.y.0 as i16,
                 bounds.size.width.0 as u16,
                 bounds.size.height.0 as u16,
@@ -564,6 +578,45 @@ impl X11WindowState {
 
         // Collect errors during setup, so that window can be destroyed on failure.
         let setup_result = maybe!({
+            // CDXC:FocusRouting 2026-09-18 WHY:
+            // Focusing the toplevel lets X11 send keys to embedded Chromium under the pointer; a leaf focus window prevents that redirection.
+            // GPUI must select and dispatch keys on the leaf itself because keyboard events do not propagate above the X focus window.
+            // SEE-ALSO: client.rs maps this child to its owning window; Ghostex's apps/desktop/src/cef/linux_x11.rs reads the property for native handoffs.
+            let keyboard_focus_window = xcb.generate_id()?;
+            check_reply(
+                || "X11 keyboard-focus window creation failed.",
+                xcb.create_window(
+                    0,
+                    keyboard_focus_window,
+                    x_window,
+                    -1,
+                    -1,
+                    1,
+                    1,
+                    0,
+                    xproto::WindowClass::INPUT_ONLY,
+                    x11rb::COPY_FROM_PARENT,
+                    &xproto::CreateWindowAux::new().event_mask(
+                        xproto::EventMask::KEY_PRESS
+                            | xproto::EventMask::KEY_RELEASE
+                            | xproto::EventMask::FOCUS_CHANGE,
+                    ),
+                ),
+            )?;
+            check_reply(
+                || "X11 keyboard-focus window mapping failed.",
+                xcb.map_window(keyboard_focus_window),
+            )?;
+            check_reply(
+                || "X11 keyboard-focus window property failed.",
+                xcb.change_property32(
+                    xproto::PropMode::REPLACE,
+                    x_window,
+                    atoms._GPUI_KEYBOARD_FOCUS_WINDOW,
+                    xproto::AtomEnum::WINDOW,
+                    &[keyboard_focus_window],
+                ),
+            )?;
             let pid = std::process::id();
             check_reply(
                 || "X11 ChangeProperty for _NET_WM_PID failed.",
@@ -589,6 +642,13 @@ impl X11WindowState {
                     xcb.configure_window(x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
                 )?;
             }
+            let mut glass = crate::linux::glass::Glass::default();
+            glass.title = params
+                .titlebar
+                .as_ref()
+                .and_then(|bar| bar.title.as_ref())
+                .map(ToString::to_string)
+                .unwrap_or_default();
             if let Some(titlebar) = params.titlebar
                 && let Some(title) = titlebar.title
             {
@@ -646,6 +706,8 @@ impl X11WindowState {
                 }
             }
 
+            #[cfg(target_os = "linux")]
+            let explicit_owner = params.x11_parent.and(parent_window.clone());
             let parent = if params.kind == WindowKind::Dialog
                 && let Some(parent) = parent_window
             {
@@ -791,6 +853,21 @@ impl X11WindowState {
                     Some((f32::from(size.width) as i32, f32::from(size.height) as i32));
             }
             size_hints.max_size = Some((max_texture_size as i32, max_texture_size as i32));
+            // CDXC:PlatformSupport 2026-09-24 WHY:
+            // A fixed-size Linux window needs equal physical-pixel size hints. Programmatic fit-height resizes update both limits, so dialogs are not trapped at their first-frame estimate.
+            let fixed_size = cfg!(target_os = "linux") && !params.is_resizable;
+            if fixed_size {
+                let dimensions = (bounds.size.width.0, bounds.size.height.0);
+                size_hints.min_size = Some(dimensions);
+                size_hints.max_size = Some(dimensions);
+            }
+            // CDXC:PlatformSupport 2026-09-29 WHY:
+            // Without a position in WM_NORMAL_HINTS, KWin applied its own placement (centered) and ignored the origin the window was created at, so a window reopened at its saved frame always came back centered. A user-specified position is the one window managers keep; KWin puts the window's visible frame there, which is the origin `bounds()` reports back.
+            size_hints.position = Some((
+                x11rb::properties::WmSizeHintsSpecification::UserSpecified,
+                bounds.origin.x.0,
+                bounds.origin.y.0,
+            ));
             check_reply(
                 || {
                     format!(
@@ -827,7 +904,14 @@ impl X11WindowState {
             let display = Rc::new(X11Display::new(xcb, scale_factor, x_screen_index)?);
 
             Ok(Self {
+                #[cfg(target_os = "linux")]
+                explicit_owner,
+                fixed_size,
+                #[cfg(target_os = "linux")]
+                owned_children: FxHashSet::default(),
                 parent,
+                keyboard_focus_window,
+                activation_focus_pending: false,
                 children: FxHashSet::default(),
                 client,
                 executor,
@@ -857,6 +941,7 @@ impl X11WindowState {
                 hidden: false,
                 appearance,
                 handle,
+                glass,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 client_side_decorations_supported,
                 decorations: WindowDecorations::Server,
@@ -892,6 +977,15 @@ impl Drop for X11Window {
 
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&self.0.x_window);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = state.explicit_owner.as_ref() {
+            owner
+                .state
+                .borrow_mut()
+                .owned_children
+                .remove(&self.0.x_window);
         }
 
         crate::fast::composition::x11::Composition::destroy(&state.fast_composition);
@@ -970,6 +1064,10 @@ impl X11Window {
 
         let state = ptr.state.borrow_mut();
         ptr.set_wm_properties(state)?;
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = ptr.state.borrow().explicit_owner.as_ref() {
+            owner.state.borrow_mut().owned_children.insert(x_window);
+        }
 
         Ok(Self(ptr))
     }
@@ -1057,6 +1155,31 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    /// Moves X focus from the toplevel to its keyboard-focus child when the WM grants focus that
+    /// `activate` asked for. Only focus arriving from outside the window (`Ancestor`, `Nonlinear`)
+    /// counts: focus coming back from an inferior is an embedded client's own handoff, and focus
+    /// already on an inferior needs no move.
+    pub(crate) fn focus_keyboard_window_after_activation(&self, detail: xproto::NotifyDetail) {
+        let keyboard_focus_window = {
+            let mut state = self.state.borrow_mut();
+            if !std::mem::take(&mut state.activation_focus_pending) {
+                return;
+            }
+            state.keyboard_focus_window
+        };
+        if detail != xproto::NotifyDetail::ANCESTOR && detail != xproto::NotifyDetail::NONLINEAR {
+            return;
+        }
+        self.xcb
+            .set_input_focus(
+                xproto::InputFocus::POINTER_ROOT,
+                keyboard_focus_window,
+                xproto::Time::CURRENT_TIME,
+            )
+            .log_err();
+        xcb_flush(&self.xcb);
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1149,6 +1272,9 @@ impl X11WindowStatePtr {
             }
         }
 
+        let active = state.active && state.visibility.is_visible();
+        state.glass.set_active(active);
+
         // The urgency hint has no withdrawal signal of its own; ICCCM leaves that to
         // the client, and focus is the conventional means for the user to zero it.
         if state.active && !was_active {
@@ -1173,6 +1299,11 @@ impl X11WindowStatePtr {
         let client = state.client.clone();
         #[allow(clippy::mutable_key_type)]
         let children = state.children.clone();
+        #[cfg(target_os = "linux")]
+        let children = children
+            .union(&state.owned_children)
+            .copied()
+            .collect::<Vec<_>>();
         drop(state);
 
         if let Some(client) = client.get_client() {
@@ -1190,6 +1321,7 @@ impl X11WindowStatePtr {
     }
 
     pub fn refresh(&self, mut request_frame_options: RequestFrameOptions) {
+        request_frame_options.force_render |= self.state.borrow().glass.needs_frame();
         let callback = self.callbacks.borrow_mut().request_frame.take();
         if let Some(mut fun) = callback {
             // Expose events can present a frame before the refresh timer runs,
@@ -1310,6 +1442,18 @@ impl X11WindowStatePtr {
             // because it contains wrong values.
             if is_resize {
                 state.bounds.size = bounds.size;
+                // CDXC:PlatformSupport 2026-09-29 WHY:
+                // Keeping the old origin on a resize left `bounds()` at the requested position after the window manager grew a client-decorated window by its `_GTK_FRAME_EXTENTS` and moved it out by the inset, while a later move reported the real one. The two differ by the inset, so a saved and restored window shifted on every launch. The real position is read from the server instead.
+                if let Some(position) = get_reply(
+                    || "X11 TranslateCoordinates after resize failed.",
+                    self.xcb
+                        .translate_coordinates(self.x_window, state.x_root_window, 0, 0),
+                )
+                .log_err()
+                {
+                    state.bounds.origin.x = px(position.dst_x as f32 / state.scale_factor);
+                    state.bounds.origin.y = px(position.dst_y as f32 / state.scale_factor);
+                }
             } else {
                 state.bounds = bounds;
             }
@@ -1362,6 +1506,11 @@ impl X11WindowStatePtr {
     pub fn set_visibility(&self, visibility: WindowVisibility) {
         if std::mem::replace(&mut self.state.borrow_mut().visibility, visibility) == visibility {
             return;
+        }
+        {
+            let mut state = self.state.borrow_mut();
+            let active = state.active && visibility.is_visible();
+            state.glass.set_active(active);
         }
         let callback = self.callbacks.borrow_mut().visibility_change.take();
         if let Some(mut fun) = callback {
@@ -1449,6 +1598,21 @@ impl PlatformWindow for X11Window {
         let size = size.to_device_pixels(state.scale_factor);
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
+        if state.fixed_size {
+            let mut hints = WmSizeHints::new();
+            let dimensions = (width as i32, height as i32);
+            hints.min_size = Some(dimensions);
+            hints.max_size = Some(dimensions);
+            if check_reply(
+                || "X11 fixed-size window hints update failed",
+                hints.set_normal_hints(&*self.0.xcb, self.0.x_window),
+            )
+            .log_err()
+            .is_none()
+            {
+                return;
+            }
+        }
 
         check_reply(
             || {
@@ -1466,6 +1630,40 @@ impl PlatformWindow for X11Window {
         )
         .log_err();
         xcb_flush(&self.0.xcb);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_x11_frame_in_parent(&mut self, frame: Bounds<Pixels>) -> bool {
+        let bounds = {
+            let state = self.0.state.borrow();
+            let Some(owner) = state.explicit_owner.as_ref() else {
+                return false;
+            };
+            let owner = owner.state.borrow();
+            if owner.renderer.is_none() {
+                return false;
+            }
+            Bounds::new(owner.bounds.origin + frame.origin, frame.size)
+        };
+        if self.bounds() == bounds {
+            return true;
+        }
+        self.resize(bounds.size);
+        let scale = self.0.state.borrow().scale_factor;
+        let origin = bounds.to_device_pixels(scale).origin;
+        let moved = check_reply(
+            || "X11 transient window placement failed",
+            self.0.xcb.configure_window(
+                self.0.x_window,
+                &xproto::ConfigureWindowAux::new()
+                    .x(origin.x.0)
+                    .y(origin.y.0),
+            ),
+        )
+        .log_err()
+        .is_some();
+        xcb_flush(&self.0.xcb);
+        moved
     }
 
     fn scale_factor(&self) -> f32 {
@@ -1536,6 +1734,18 @@ impl PlatformWindow for X11Window {
     }
 
     fn activate(&self) {
+        // CDXC:PlatformSupport 2026-09-11 WHY:
+        // Windows created with show=false stay unmapped until activation; requesting focus alone cannot reveal them.
+        // SEE-ALSO: gpui/src/window.rs (initial mapping respects show).
+        if check_reply(
+            || "X11 MapWindow on activation failed.",
+            self.0.xcb.map_window(self.0.x_window),
+        )
+        .log_err()
+        .is_none()
+        {
+            return;
+        }
         let data = [1, xproto::Time::CURRENT_TIME.into(), 0, 0, 0];
         let message = xproto::ClientMessageEvent::new(
             32,
@@ -1552,6 +1762,24 @@ impl PlatformWindow for X11Window {
                 message,
             )
             .log_err();
+        // CDXC:FocusRouting 2026-09-26 WHY:
+        // Activation is the WM's to grant (`_NET_ACTIVE_WINDOW` above; upstream stopped forcing SetInputFocus on the toplevel so the WM's focus policy holds). GPUI still has to put the keyboard on its leaf child once it has focus, or keys go to embedded Chromium under the pointer. A window that already holds focus moves it to the leaf now; otherwise the leaf takes it when the WM's FocusIn arrives (`focus_keyboard_window_after_activation`).
+        let (active, keyboard_focus_window) = {
+            let state = self.0.state.borrow();
+            (state.active, state.keyboard_focus_window)
+        };
+        if active {
+            self.0
+                .xcb
+                .set_input_focus(
+                    xproto::InputFocus::POINTER_ROOT,
+                    keyboard_focus_window,
+                    xproto::Time::CURRENT_TIME,
+                )
+                .log_err();
+        } else {
+            self.0.state.borrow_mut().activation_focus_pending = true;
+        }
         xcb_flush(&self.0.xcb);
     }
 
@@ -1576,6 +1804,7 @@ impl PlatformWindow for X11Window {
     }
 
     fn set_title(&mut self, title: &str) {
+        self.0.state.borrow_mut().glass.title = title.to_owned();
         check_reply(
             || "X11 ChangeProperty8 on WM_NAME failed.",
             self.0.xcb.change_property8(
@@ -1634,6 +1863,51 @@ impl PlatformWindow for X11Window {
         let mut state = self.0.state.borrow_mut();
         state.background_appearance = background_appearance;
         state.update_transparency();
+        // KWin's property is also understood by compositors implementing its blur contract.
+        // Empty CARDINAL data means the whole window; deleting it removes the request.
+        if background_appearance == WindowBackgroundAppearance::Blurred {
+            self.0
+                .xcb
+                .change_property32(
+                    xproto::PropMode::REPLACE,
+                    self.0.x_window,
+                    state.atoms._KDE_NET_WM_BLUR_BEHIND_REGION,
+                    xproto::AtomEnum::CARDINAL,
+                    &[],
+                )
+                .log_err();
+        } else {
+            self.0
+                .xcb
+                .delete_property(self.0.x_window, state.atoms._KDE_NET_WM_BLUR_BEHIND_REGION)
+                .log_err();
+        }
+        xcb_flush(&self.0.xcb);
+        state.force_render_after_recovery = true;
+    }
+
+    fn set_background_wallpaper(&self, enabled: bool) {
+        self.0.state.borrow_mut().glass.enabled = enabled;
+    }
+    fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        self.0.state.borrow_mut().glass.image = image;
+    }
+    fn set_background_wallpaper_follows_screen(&self, follows: bool) {
+        self.0.state.borrow_mut().glass.follows_screen = follows;
+    }
+    fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        self.0.state.borrow_mut().glass.cover = cover;
+    }
+    fn set_background_blur_style(&self, radius: Pixels, _keep_saturation: bool) {
+        self.0.state.borrow_mut().glass.set_blur_radius(radius);
+    }
+    fn set_background_live(&self, live: Option<gpui::LiveBackground>) {
+        self.0.state.borrow_mut().glass.live = live;
+    }
+    fn set_background_video(&self, video: Option<std::path::PathBuf>, only_on_power: bool) {
+        let mut state = self.0.state.borrow_mut();
+        state.glass.video = video;
+        state.glass.only_on_power = only_on_power;
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -1745,7 +2019,10 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().close = Some(callback);
     }
 
-    fn on_hit_test_window_control(&self, _callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        _callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>,
+    ) {
     }
 
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>) {
@@ -1783,9 +2060,20 @@ impl PlatformWindow for X11Window {
             return;
         }
 
+        let active = inner.active && inner.visibility.is_visible();
+        let bounds = inner.bounds;
+        let screen = inner.display.bounds();
+        let light = matches!(
+            inner.appearance,
+            WindowAppearance::Light | WindowAppearance::VibrantLight
+        );
+        let frame = inner
+            .glass
+            .frame(active, bounds, screen, None, light, false);
+        renderer.set_glass_frame(frame);
         renderer.draw(scene);
 
-        if renderer.needs_redraw() {
+        if renderer.needs_redraw() || inner.glass.needs_frame() {
             inner.force_render_after_recovery = true;
         }
     }

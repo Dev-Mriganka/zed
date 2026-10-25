@@ -212,6 +212,8 @@ impl WgpuResources {
 }
 
 pub(crate) struct WgpuRendererCore {
+    glass: Option<crate::glass::GlassRenderer>,
+    frame_size: [u32; 2],
     pub(crate) resources: WgpuResources,
     pub(crate) atlas: Arc<WgpuAtlas>,
     pub(crate) path_globals_offset: u64,
@@ -1120,6 +1122,25 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    pub fn set_glass_frame(&mut self, frame: Option<crate::GlassFrame>) {
+        let Some(core) = self.core_mut() else {
+            return;
+        };
+        match frame {
+            None => core.glass = None,
+            Some(frame) => match core.glass.as_mut() {
+                Some(glass) => glass.set_frame(frame),
+                None => {
+                    core.glass = Some(crate::glass::GlassRenderer::new(
+                        &core.resources.device,
+                        core.target_format,
+                        frame,
+                    ))
+                }
+            },
+        }
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
@@ -1339,6 +1360,8 @@ impl WgpuRendererCore {
         let max_texture_size = device.limits().max_texture_dimension_2d;
 
         Self {
+            glass: None,
+            frame_size: [1, 1],
             resources: WgpuResources {
                 device,
                 queue,
@@ -1435,6 +1458,7 @@ impl WgpuRendererCore {
             self.max_texture_size
         );
 
+        self.frame_size = [size.width.0 as u32, size.height.0 as u32];
         self.atlas.before_frame();
         self.ensure_intermediate_textures(size);
 
@@ -1498,6 +1522,15 @@ impl WgpuRendererCore {
                     label: Some("main_encoder"),
                 });
 
+        if let Some(glass) = &mut self.glass {
+            glass.draw(
+                &self.resources.device,
+                &self.resources.queue,
+                &mut encoder,
+                frame_view,
+                self.frame_size,
+            );
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1505,7 +1538,11 @@ impl WgpuRendererCore {
                     view: frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: if self.glass.is_some() {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(clear_color)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -2156,8 +2193,21 @@ impl WgpuRenderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface_config.alpha_mode = alpha_mode;
+        // Only a mode the new surface supports, as `new_internal` checks: configuring an unsupported
+        // one (Mailbox on a Fifo-only Android surface) panics. Otherwise the mode already validated
+        // for this renderer stays.
         if let Some(mode) = config.preferred_present_mode {
-            self.surface_config.present_mode = mode;
+            let supported = self.context.as_ref().is_some_and(|context| {
+                context.borrow().as_ref().is_some_and(|context| {
+                    surface
+                        .get_capabilities(&context.adapter)
+                        .present_modes
+                        .contains(&mode)
+                })
+            });
+            if supported {
+                self.surface_config.present_mode = mode;
+            }
         }
 
         let mut core = match std::mem::replace(&mut self.state, RendererState::Released) {

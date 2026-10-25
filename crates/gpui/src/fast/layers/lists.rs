@@ -1639,6 +1639,26 @@ fn drawn_alike(a: &Row, b: &Row) -> bool {
                 PaintOperation::FastRoundedClip(clip) => {
                     PaintOperation::FastRoundedClip(clip.translated(to_row))
                 }
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    effect,
+                    bounds,
+                    content_mask,
+                } => PaintOperation::StartEffect {
+                    effect: effect.clone(),
+                    bounds: Bounds {
+                        origin: bounds.origin + to_row,
+                        size: bounds.size,
+                    },
+                    content_mask: ContentMask {
+                        bounds: Bounds {
+                            origin: content_mask.bounds.origin + to_row,
+                            size: content_mask.bounds.size,
+                        },
+                    },
+                },
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => PaintOperation::EndEffect,
             })
             .collect();
         let (tiles, _) = part_tile_hashes(&operations, paint::TILE_SIZE);
@@ -2844,6 +2864,17 @@ pub(crate) fn end_paint_rows(window: &mut Window, cx: &mut App, id: Option<&Glob
                 PaintOperation::StartLayer(bounds) => bounds.origin = bounds.origin + to_content,
                 PaintOperation::EndLayer => {}
                 PaintOperation::FastRoundedClip(clip) => *clip = clip.translated(to_content),
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    bounds,
+                    content_mask,
+                    ..
+                } => {
+                    bounds.origin = bounds.origin + to_content;
+                    content_mask.bounds.origin = content_mask.bounds.origin + to_content;
+                }
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => {}
             }
         }
         let (row_operations, overlay, whole) =

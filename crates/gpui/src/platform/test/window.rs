@@ -30,7 +30,8 @@ pub(crate) struct TestWindowState {
     sprite_atlas: Arc<dyn PlatformAtlas>,
     renderer: Option<Box<dyn PlatformHeadlessRenderer>>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
-    hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
+    hit_test_window_control_callback:
+        Option<Box<dyn FnMut(crate::Point<crate::Pixels>) -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     visibility: WindowVisibility,
@@ -536,7 +537,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_close(&self, _callback: Box<dyn FnOnce()>) {}
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(crate::Point<crate::Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.0.lock().hit_test_window_control_callback = Some(callback);
     }
 

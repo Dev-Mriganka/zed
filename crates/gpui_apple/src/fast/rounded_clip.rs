@@ -217,12 +217,24 @@ fn encode<'a>(
             PrimitiveBatch::Paths(range) => {
                 encoder.end_encoding();
                 let paths = &scene.paths[range];
-                let drawn =
-                    renderer.draw_paths_to_intermediate(paths, writer, viewport, commands)?;
+                let path_textures = renderer.window_path_textures();
+                let drawn = renderer.draw_paths_to_intermediate(
+                    paths,
+                    writer,
+                    viewport,
+                    commands,
+                    &path_textures,
+                )?;
                 encoder = new_command_encoder_for_texture(commands, texture, viewport, None);
                 bind(encoder, clips, &renderer.device);
                 if drawn {
-                    renderer.draw_paths_from_intermediate(paths, writer, viewport, encoder)?;
+                    renderer.draw_paths_from_intermediate(
+                        paths,
+                        writer,
+                        viewport,
+                        encoder,
+                        &path_textures,
+                    )?;
                 }
             }
             PrimitiveBatch::Surfaces(range) => renderer.draw_surfaces(

@@ -301,6 +301,105 @@ impl A11y {
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
     }
+
+    /// Where the nodes a cached view is about to push will start, when the tree is being built.
+    pub(crate) fn capture_start(&self) -> Option<A11yCaptureStart> {
+        self.is_active().then(|| A11yCaptureStart {
+            children: self.nodes.current_children().len(),
+            nodes: self.nodes.all_nodes.len(),
+            focus: self.nodes.focus,
+            active_descendant: self.nodes.active_descendant,
+        })
+    }
+
+    /// The subtree pushed since `start`, which a reused cached view replays: its prepaint does not
+    /// run again, so nothing else would put these nodes back in the tree.
+    pub(crate) fn capture_end(&self, start: A11yCaptureStart) -> A11yCapture {
+        let top_level = self
+            .nodes
+            .current_children()
+            .get(start.children..)
+            .map(<[NodeId]>::to_vec)
+            .unwrap_or_default();
+        let nodes = self
+            .nodes
+            .all_nodes
+            .get(start.nodes..)
+            .map(<[(NodeId, accesskit::Node)]>::to_vec)
+            .unwrap_or_default();
+        let bounds = nodes
+            .iter()
+            .filter_map(|(id, _)| self.node_bounds.get(id).map(|bounds| (*id, *bounds)))
+            .collect();
+        let focus_ids = nodes
+            .iter()
+            .filter_map(|(id, _)| self.focus_ids.get(id).map(|focus| (*id, *focus)))
+            .collect();
+        A11yCapture {
+            top_level,
+            nodes,
+            bounds,
+            focus_ids,
+            focus: (self.nodes.focus != start.focus)
+                .then_some(self.nodes.focus)
+                .flatten(),
+            active_descendant: (self.nodes.active_descendant != start.active_descendant)
+                .then_some(self.nodes.active_descendant)
+                .flatten(),
+        }
+    }
+
+    /// Puts a reused cached view's subtree back under the current node. Its focus is restored only
+    /// while the window's focus is still the element that held it.
+    pub(crate) fn replay(&mut self, capture: &A11yCapture, window_focus: Option<FocusId>) {
+        if !self.is_active() {
+            return;
+        }
+        for (id, node) in &capture.nodes {
+            if self.nodes.seen_ids.insert(*id) {
+                self.nodes.all_nodes.push((*id, node.clone()));
+            }
+        }
+        if let Some(parent) = self.nodes.nodes_stack.last_mut() {
+            for id in &capture.top_level {
+                parent.push_child(*id);
+            }
+        }
+        self.node_bounds.extend(capture.bounds.iter().copied());
+        self.focus_ids.extend(capture.focus_ids.iter().copied());
+        let still_focused = |node: NodeId| {
+            window_focus.is_some()
+                && capture
+                    .focus_ids
+                    .iter()
+                    .any(|(id, focus)| *id == node && Some(*focus) == window_focus)
+        };
+        if let Some(focus) = capture.focus.filter(|focus| still_focused(*focus)) {
+            self.nodes.focus = Some(focus);
+            if let Some(active) = capture.active_descendant {
+                self.nodes.active_descendant = Some(active);
+            }
+        }
+    }
+}
+
+/// See [`A11y::capture_start`].
+pub(crate) struct A11yCaptureStart {
+    children: usize,
+    nodes: usize,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
+}
+
+/// See [`A11y::capture_end`].
+#[derive(Clone, Default)]
+pub(crate) struct A11yCapture {
+    top_level: Vec<NodeId>,
+    nodes: Vec<(NodeId, accesskit::Node)>,
+    bounds: Vec<(NodeId, Bounds<Pixels>)>,
+    focus_ids: Vec<(NodeId, FocusId)>,
+    focus: Option<NodeId>,
+    active_descendant: Option<NodeId>,
 }
 
 /// Builder API for synthetic children. See the docs for
@@ -466,6 +565,13 @@ impl A11yNodeBuilder {
 
     pub(crate) fn current_node_mut(&mut self) -> Option<&mut accesskit::Node> {
         self.nodes_stack.last_mut()
+    }
+
+    fn current_children(&self) -> &[NodeId] {
+        self.nodes_stack
+            .last()
+            .map(accesskit::Node::children)
+            .unwrap_or_default()
     }
 
     /// Pop the current node off the stack and finalize it into the all_nodes

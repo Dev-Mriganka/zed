@@ -641,6 +641,13 @@ pub(crate) fn replay_layers(scene: &mut Scene, range: Range<usize>, previous: &S
 /// Draws the primitives of `content`, moved by `delta` into window space,
 /// straight into the frame, clipped to the viewport, the current content
 /// mask: what painting the content into the frame would have drawn.
+///
+/// A layer draws the content of a shader effect (macOS) plain, here as in
+/// its tiles: tiles are rasterized from [`Scene::batches`], which has no
+/// effect groups, so opening the effect there would lose its content. Every
+/// scene a layer builds from paint operations skips `StartEffect` and
+/// `EndEffect` and keeps the primitives between them, so a layer looks the
+/// same whether it is drawn from tiles or straight into the frame.
 pub(crate) fn draw_into_frame<'a>(
     window: &mut Window,
     operations: impl IntoIterator<Item = &'a PaintOperation>,
@@ -667,6 +674,8 @@ pub(crate) fn draw_into_frame<'a>(
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(scene, clip.translated(delta))
             }
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
         }
     }
 }
@@ -696,6 +705,8 @@ fn clip_primitive(primitive: &mut Primitive, viewports: Viewports) {
         Primitive::SubpixelSprite(p) => clip(&mut p.content_mask),
         Primitive::PolychromeSprite(p) => clip(&mut p.content_mask),
         Primitive::Surface(p) => clip(&mut p.content_mask),
+        #[cfg(target_os = "macos")]
+        Primitive::Effect(p) => clip(&mut p.content_mask),
     }
 }
 
@@ -924,6 +935,9 @@ fn translated_scene(scene: &Scene, delta: Point<ScaledPixels>) -> Scene {
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut translated, clip.translated(delta))
             }
+            // Drawn plain in a layer; see `draw_into_frame`.
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
         }
     }
     translated.finish();

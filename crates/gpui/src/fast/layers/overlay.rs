@@ -57,6 +57,8 @@ fn rank(primitive: &Primitive) -> u8 {
         Primitive::SubpixelSprite(_) => 5,
         Primitive::PolychromeSprite(_) => 6,
         Primitive::Surface(_) => 7,
+        #[cfg(target_os = "macos")]
+        Primitive::Effect(_) => 8,
     }
 }
 
@@ -78,6 +80,14 @@ pub(crate) fn split(
     if operations
         .iter()
         .any(|operation| matches!(operation, PaintOperation::FastRoundedClip(_)))
+    {
+        return None;
+    }
+    // TRIAL: a shader effect keeps its scene whole, as a rounded clip does.
+    #[cfg(target_os = "macos")]
+    if operations
+        .iter()
+        .any(|operation| matches!(operation, PaintOperation::StartEffect { .. }))
     {
         return None;
     }
@@ -119,6 +129,18 @@ pub(crate) fn split(
             PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
             PaintOperation::EndLayer => PaintOperation::EndLayer,
             PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(*clip),
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect {
+                effect,
+                bounds,
+                content_mask,
+            } => PaintOperation::StartEffect {
+                effect: effect.clone(),
+                bounds: *bounds,
+                content_mask: *content_mask,
+            },
+            #[cfg(target_os = "macos")]
+            PaintOperation::EndEffect => PaintOperation::EndEffect,
         })
         .collect();
     Some((tiles, overlay))
@@ -139,6 +161,14 @@ pub(crate) fn lift(content: Scene) -> (Scene, Rc<[Primitive]>) {
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut rest, clip)
             }
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect {
+                effect,
+                bounds,
+                content_mask,
+            } => rest.push_effect(effect, bounds, content_mask),
+            #[cfg(target_os = "macos")]
+            PaintOperation::EndEffect => rest.pop_effect(),
         }
     }
     rest.finish();

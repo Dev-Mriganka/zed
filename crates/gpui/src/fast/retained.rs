@@ -277,6 +277,31 @@ pub(crate) struct RetainedState {
     pub(crate) installed_input_focus: Option<Option<crate::FocusId>>,
 }
 
+/// Ghostex: the retention a new window starts with, once the host has chosen it
+/// ([`set_default_view_retention`]): 0 unset, 1 off, 2 on.
+static DEFAULT_VIEW_RETENTION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Ghostex: sets whether windows opened from now on draw views again from the last frame
+/// (see [`Window::set_view_retention`]), in place of the `GPUI_VIEW_RETENTION` environment
+/// variable. Windows already open keep theirs; the host updates them with
+/// [`Window::set_view_retention`].
+pub fn set_default_view_retention(enabled: bool) {
+    DEFAULT_VIEW_RETENTION.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Ghostex: off unless the host turns it on (or `GPUI_VIEW_RETENTION=1`), so every entry point
+/// draws as upstream GPUI does until its setting says otherwise.
+fn default_view_retention() -> bool {
+    match DEFAULT_VIEW_RETENTION.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => std::env::var("GPUI_VIEW_RETENTION").is_ok_and(|value| value != "0"),
+    }
+}
+
 impl RetainedState {
     pub(crate) fn new(cx: &App) -> Self {
         RetainedState {
@@ -289,7 +314,7 @@ impl RetainedState {
             open_paints: Vec::new(),
             prebuilt: FxHashMap::default(),
             notified_entities: FxHashSet::default(),
-            view_retention: std::env::var("GPUI_VIEW_RETENTION").map_or(true, |value| value != "0"),
+            view_retention: default_view_retention(),
             splice_keys: FxHashSet::default(),
             rendering_since: FxHashMap::default(),
             render_writes: FxHashMap::default(),
@@ -327,6 +352,8 @@ impl PrepaintStateIndex {
         PrepaintStateIndex {
             hitboxes_index: self.hitboxes_index - from.hitboxes_index + to.hitboxes_index,
             tooltips_index: self.tooltips_index - from.tooltips_index + to.tooltips_index,
+            native_occlusions_index: self.native_occlusions_index - from.native_occlusions_index
+                + to.native_occlusions_index,
             deferred_draws_index: self.deferred_draws_index - from.deferred_draws_index
                 + to.deferred_draws_index,
             dispatch_tree_index: self.dispatch_tree_index - from.dispatch_tree_index
@@ -349,6 +376,7 @@ impl PartialEq for PrepaintStateIndex {
         let PrepaintStateIndex {
             hitboxes_index,
             tooltips_index,
+            native_occlusions_index,
             deferred_draws_index,
             dispatch_tree_index,
             accessed_element_states_index,
@@ -358,6 +386,7 @@ impl PartialEq for PrepaintStateIndex {
         *fast_a11y_index == other.fast_a11y_index
             && *hitboxes_index == other.hitboxes_index
             && *tooltips_index == other.tooltips_index
+            && *native_occlusions_index == other.native_occlusions_index
             && *deferred_draws_index == other.deferred_draws_index
             && *dispatch_tree_index == other.dispatch_tree_index
             && *accessed_element_states_index == other.accessed_element_states_index
@@ -563,7 +592,8 @@ impl Window {
     /// Turning it off draws every view from scratch each frame, as upstream
     /// GPUI does. The `GPUI_VIEW_RETENTION=0` environment variable turns it
     /// off for every window.
-    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// Ghostex: public, so the host's setting can switch it without a restart.
     pub fn set_view_retention(&mut self, enabled: bool) {
         if self.retained_state.view_retention != enabled {
             self.retained_state.view_retention = enabled;
@@ -573,7 +603,6 @@ impl Window {
 
     /// Whether views are drawn again from what they drew on the last frame.
     /// See [`Window::set_view_retention`].
-    #[cfg(any(test, feature = "test-support"))]
     pub fn view_retention(&self) -> bool {
         self.retained_state.view_retention
     }

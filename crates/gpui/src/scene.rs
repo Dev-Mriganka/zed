@@ -8,6 +8,8 @@ use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 use std::{
     fmt::Debug,
     iter::Peekable,
@@ -53,6 +55,17 @@ pub struct Scene {
     pub(crate) sort_scratch: crate::fast::scene::SortScratch,
     pub(crate) fast_rounded_clip: crate::fast::rounded_clip::SceneClips,
     pub layers: crate::fast::layers::scene::SceneLayers,
+    #[cfg(target_os = "macos")]
+    pub effects: Vec<PaintEffect>,
+    /// The effect whose children are being captured. Its primitives are placed
+    /// in its own scene, while this scene still records every paint operation
+    /// so that `PaintIndex` ranges and cached replay keep indexing one list.
+    #[cfg(target_os = "macos")]
+    pending_effect: Option<Box<PendingEffect>>,
+    /// Effects opened while another one is being captured. They don't nest:
+    /// their content simply stays part of the outer effect.
+    #[cfg(target_os = "macos")]
+    nested_effect_depth: usize,
 }
 
 #[expect(missing_docs)]
@@ -71,6 +84,12 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         crate::fast::layers::scene::SceneLayers::clear(&mut self.layers);
+        #[cfg(target_os = "macos")]
+        {
+            self.effects.clear();
+            self.pending_effect = None;
+            self.nested_effect_depth = 0;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -78,25 +97,114 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        #[cfg(target_os = "macos")]
+        match self.pending_effect.as_mut() {
+            Some(pending) => pending.scene.open_layer(bounds),
+            None => self.open_layer(bounds),
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.open_layer(bounds);
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
+        #[cfg(target_os = "macos")]
+        match self.pending_effect.as_mut() {
+            Some(pending) => pending.scene.layer_stack.pop(),
+            None => self.layer_stack.pop(),
+        };
+        #[cfg(not(target_os = "macos"))]
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
+    fn open_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        let order = self.primitive_bounds.insert(bounds);
+        self.layer_stack.push(order);
+    }
+
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        #[cfg(target_os = "macos")]
+        let placed = match self.pending_effect.as_mut() {
+            Some(pending) => pending.scene.place_primitive(&mut primitive),
+            None => self.place_primitive(&mut primitive),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let placed = self.place_primitive(&mut primitive);
+        if placed {
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+        }
+    }
+
+    /// Starts capturing everything painted until [`Scene::pop_effect`] into a
+    /// child scene that is drawn offscreen and run through `effect`.
+    #[cfg(target_os = "macos")]
+    pub fn push_effect(
+        &mut self,
+        effect: ShaderEffect,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    ) {
+        self.paint_operations.push(PaintOperation::StartEffect {
+            effect: effect.clone(),
+            bounds,
+            content_mask,
+        });
+        if self.pending_effect.is_some() {
+            self.nested_effect_depth += 1;
+            return;
+        }
+        self.pending_effect = Some(Box::new(PendingEffect {
+            effect,
+            bounds,
+            content_mask,
+            scene: Scene::default(),
+        }));
+    }
+
+    /// Finishes the capture started by [`Scene::push_effect`] and inserts the
+    /// effect group with a draw order of its own, after anything already
+    /// painted beneath it.
+    #[cfg(target_os = "macos")]
+    pub fn pop_effect(&mut self) {
+        self.paint_operations.push(PaintOperation::EndEffect);
+        if self.nested_effect_depth > 0 {
+            self.nested_effect_depth -= 1;
+            return;
+        }
+        let Some(pending) = self.pending_effect.take() else {
+            return;
+        };
+        let PendingEffect {
+            effect,
+            bounds,
+            content_mask,
+            mut scene,
+        } = *pending;
+        scene.finish();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let scene = Arc::new(scene);
+        // Not recorded as a paint operation: replaying the StartEffect..EndEffect
+        // range rebuilds it, so recording it too would draw it twice.
+        self.place_primitive(&mut Primitive::Effect(PaintEffect {
+            order: 0,
+            bounds,
+            content_mask,
+            effect,
+            scene,
+        }));
+    }
+
+    fn place_primitive(&mut self, primitive: &mut Primitive) -> bool {
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
 
         if clipped_bounds.is_empty() {
-            return;
+            return false;
         }
 
         let order = self
@@ -104,7 +212,7 @@ impl Scene {
             .last()
             .copied()
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
-        match &mut primitive {
+        match primitive {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(*shadow);
@@ -138,9 +246,13 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            #[cfg(target_os = "macos")]
+            Primitive::Effect(effect) => {
+                effect.order = order;
+                self.effects.push(effect.clone());
+            }
         }
-        self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+        true
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -153,12 +265,48 @@ impl Scene {
                 PaintOperation::FastRoundedClip(fast_clip) => {
                     crate::fast::rounded_clip::record(self, *fast_clip)
                 }
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    effect,
+                    bounds,
+                    content_mask,
+                } => self.push_effect(effect.clone(), *bounds, *content_mask),
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => self.pop_effect(),
             }
         }
     }
 
     pub fn finish(&mut self) {
         crate::fast::scene::sort_in_drawing_order(self);
+        #[cfg(target_os = "macos")]
+        {
+            debug_assert!(
+                self.pending_effect.is_none(),
+                "a shader effect was pushed without being popped"
+            );
+            self.effects.sort_by_key(|effect| effect.order);
+        }
+    }
+
+    /// Batches of ordinary primitives in draw order. Effect groups are left out;
+    /// renderers that draw them use [`Scene::scene_batches`].
+    #[cfg_attr(
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            not(any(feature = "x11", feature = "wayland"))
+        ),
+        allow(dead_code)
+    )]
+    pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+        self.batch_iterator()
+    }
+
+    /// Primitive batches interleaved with effect groups, in draw order.
+    #[cfg(target_os = "macos")]
+    pub fn scene_batches(&self) -> impl Iterator<Item = SceneBatch> + '_ {
+        let mut iterator = self.batch_iterator();
+        std::iter::from_fn(move || iterator.next_batch())
     }
 
     #[cfg_attr(
@@ -168,7 +316,7 @@ impl Scene {
         ),
         allow(dead_code)
     )]
-    pub fn batches(&self) -> impl Iterator<Item = PrimitiveBatch> + '_ {
+    fn batch_iterator(&self) -> BatchIterator<'_> {
         BatchIterator {
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
@@ -186,6 +334,10 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            #[cfg(target_os = "macos")]
+            effects_start: 0,
+            #[cfg(target_os = "macos")]
+            effects_iter: self.effects.iter().peekable(),
         }
     }
 }
@@ -208,6 +360,8 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    #[cfg(target_os = "macos")]
+    Effect,
 }
 
 pub(crate) enum PaintOperation {
@@ -215,6 +369,14 @@ pub(crate) enum PaintOperation {
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     FastRoundedClip(crate::fast::rounded_clip::ClipOperation),
+    #[cfg(target_os = "macos")]
+    StartEffect {
+        effect: ShaderEffect,
+        bounds: Bounds<ScaledPixels>,
+        content_mask: ContentMask<ScaledPixels>,
+    },
+    #[cfg(target_os = "macos")]
+    EndEffect,
 }
 
 #[derive(Clone)]
@@ -228,6 +390,8 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    #[cfg(target_os = "macos")]
+    Effect(PaintEffect),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +406,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            #[cfg(target_os = "macos")]
+            Primitive::Effect(effect) => &effect.bounds,
         }
     }
 
@@ -255,6 +421,8 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            #[cfg(target_os = "macos")]
+            Primitive::Effect(effect) => &effect.content_mask,
         }
     }
 }
@@ -283,12 +451,37 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    #[cfg(target_os = "macos")]
+    effects_start: usize,
+    #[cfg(target_os = "macos")]
+    effects_iter: Peekable<slice::Iter<'a, PaintEffect>>,
+}
+
+/// One draw step of a [`Scene`] in paint order.
+#[derive(Debug)]
+#[allow(missing_docs)]
+pub enum SceneBatch {
+    Primitives(PrimitiveBatch),
+    /// Index into [`Scene::effects`]. Effects are never batched together
+    /// because each one renders its own offscreen scene.
+    #[cfg(target_os = "macos")]
+    Effect(usize),
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
+        std::iter::from_fn(|| self.next_batch()).find_map(|batch| match batch {
+            SceneBatch::Primitives(batch) => Some(batch),
+            #[cfg(target_os = "macos")]
+            SceneBatch::Effect(_) => None,
+        })
+    }
+}
+
+impl<'a> BatchIterator<'a> {
+    fn next_batch(&mut self) -> Option<SceneBatch> {
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -316,6 +509,11 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
             ),
+            #[cfg(target_os = "macos")]
+            (
+                self.effects_iter.peek().map(|effect| effect.order),
+                PrimitiveKind::Effect,
+            ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
 
@@ -327,7 +525,14 @@ impl<'a> Iterator for BatchIterator<'a> {
             return None;
         };
 
-        match batch_kind {
+        let batch = match batch_kind {
+            #[cfg(target_os = "macos")]
+            PrimitiveKind::Effect => {
+                let effect_index = self.effects_start;
+                self.effects_iter.next();
+                self.effects_start += 1;
+                return Some(SceneBatch::Effect(effect_index));
+            }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -340,7 +545,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     shadows_end += 1;
                 }
                 self.shadows_start = shadows_end;
-                Some(PrimitiveBatch::Shadows(shadows_start..shadows_end))
+                PrimitiveBatch::Shadows(shadows_start..shadows_end)
             }
             PrimitiveKind::Quad => {
                 let quads_start = self.quads_start;
@@ -354,7 +559,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     quads_end += 1;
                 }
                 self.quads_start = quads_end;
-                Some(PrimitiveBatch::Quads(quads_start..quads_end))
+                PrimitiveBatch::Quads(quads_start..quads_end)
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -368,7 +573,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     paths_end += 1;
                 }
                 self.paths_start = paths_end;
-                Some(PrimitiveBatch::Paths(paths_start..paths_end))
+                PrimitiveBatch::Paths(paths_start..paths_end)
             }
             PrimitiveKind::Underline => {
                 let underlines_start = self.underlines_start;
@@ -382,7 +587,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     underlines_end += 1;
                 }
                 self.underlines_start = underlines_end;
-                Some(PrimitiveBatch::Underlines(underlines_start..underlines_end))
+                PrimitiveBatch::Underlines(underlines_start..underlines_end)
             }
             PrimitiveKind::MonochromeSprite => {
                 let texture_id = self.monochrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -400,10 +605,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites_end += 1;
                 }
                 self.monochrome_sprites_start = sprites_end;
-                Some(PrimitiveBatch::MonochromeSprites {
+                PrimitiveBatch::MonochromeSprites {
                     texture_id,
                     range: sprites_start..sprites_end,
-                })
+                }
             }
             PrimitiveKind::SubpixelSprite => {
                 let texture_id = self.subpixel_sprites_iter.peek().unwrap().tile.texture_id;
@@ -421,10 +626,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites_end += 1;
                 }
                 self.subpixel_sprites_start = sprites_end;
-                Some(PrimitiveBatch::SubpixelSprites {
+                PrimitiveBatch::SubpixelSprites {
                     texture_id,
                     range: sprites_start..sprites_end,
-                })
+                }
             }
             PrimitiveKind::PolychromeSprite => {
                 let texture_id = self.polychrome_sprites_iter.peek().unwrap().tile.texture_id;
@@ -442,10 +647,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     sprites_end += 1;
                 }
                 self.polychrome_sprites_start = sprites_end;
-                Some(PrimitiveBatch::PolychromeSprites {
+                PrimitiveBatch::PolychromeSprites {
                     texture_id,
                     range: sprites_start..sprites_end,
-                })
+                }
             }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
@@ -459,9 +664,10 @@ impl<'a> Iterator for BatchIterator<'a> {
                     surfaces_end += 1;
                 }
                 self.surfaces_start = surfaces_end;
-                Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
+                PrimitiveBatch::Surfaces(surfaces_start..surfaces_end)
             }
-        }
+        };
+        Some(SceneBatch::Primitives(batch))
     }
 }
 
@@ -777,6 +983,63 @@ impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
     }
+}
+
+/// A chain of runtime-compiled Metal fragment shaders applied to everything
+/// painted inside [`crate::Window::paint_effect`].
+///
+/// Each pass is drawn over a single full-texture triangle and follows the
+/// Shadertoy ABI Ghostty's shader compiler emits: a `fragment` entry point
+/// named `main0`, the previous pass's output (the captured content for the
+/// first pass) at texture 0 with a linear, clamp-to-edge sampler at sampler 0,
+/// and [`ShaderEffect::uniforms`] at buffer 1. Fragment coordinates start at
+/// the top-left of the effect's bounds, in device pixels.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub struct ShaderEffect {
+    /// Stable for the lifetime of one painted surface. The renderer keeps the
+    /// offscreen textures for an id alive while it keeps being painted.
+    pub id: u64,
+    /// Metal source for each pass, run in order. A source is compiled once and
+    /// cached by its text. A compile failure is logged and disables the whole
+    /// chain, leaving the captured content unshaded.
+    pub shaders: Arc<[Arc<str>]>,
+    /// The uniform block bound at buffer 1 for every pass. It is uploaded as-is,
+    /// so it must already follow the shader's layout (std140 for Ghostty).
+    pub uniforms: Arc<[u8]>,
+}
+
+/// Maximum supported canvas dimension for the Metal shader-effect textures.
+#[cfg(target_os = "macos")]
+pub const MAX_SHADER_EFFECT_TEXTURE_SIZE: i32 = 16_384;
+
+/// An offscreen group created by [`crate::Window::paint_effect`]: `scene` holds
+/// the captured children in window coordinates, and the renderer draws the
+/// shaded result at `bounds`, clipped by `content_mask`.
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+#[allow(missing_docs)]
+pub struct PaintEffect {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub effect: ShaderEffect,
+    pub scene: Arc<Scene>,
+}
+
+#[cfg(target_os = "macos")]
+impl From<PaintEffect> for Primitive {
+    fn from(effect: PaintEffect) -> Self {
+        Primitive::Effect(effect)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct PendingEffect {
+    effect: ShaderEffect,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    scene: Scene,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]

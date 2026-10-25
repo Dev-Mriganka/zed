@@ -151,10 +151,7 @@ pub(crate) unsafe fn build_overlay_view_class() {
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
         decl.add_ivar::<*mut c_void>(OVERLAY_INPUT_IVAR);
         unsafe {
-            decl.add_method(
-                sel!(dealloc),
-                dealloc_overlay_view as extern "C" fn(_, Sel),
-            );
+            decl.add_method(sel!(dealloc), dealloc_overlay_view as extern "C" fn(_, Sel));
             decl.add_method(
                 sel!(hitTest:),
                 overlay_hit_test as extern "C" fn(_, Sel, NSPoint) -> Id,
@@ -176,10 +173,7 @@ pub(crate) unsafe fn build_overlay_view_class() {
                 sel!(swipeWithEvent:),
                 sel!(pressureChangeWithEvent:),
             ] {
-                decl.add_method(
-                    selector,
-                    handle_overlay_event as extern "C" fn(_, Sel, Id),
-                );
+                decl.add_method(selector, handle_overlay_event as extern "C" fn(_, Sel, Id));
             }
         }
         decl.register() as *const AnyClass
@@ -790,12 +784,16 @@ unsafe fn create_gpui_surface(
         set_ivar(
             &*view,
             WINDOW_STATE_IVAR,
-            Arc::into_raw(window_state.clone()).cast_mut().cast::<c_void>(),
+            Arc::into_raw(window_state.clone())
+                .cast_mut()
+                .cast::<c_void>(),
         );
         set_ivar(
             &*view,
             OVERLAY_INPUT_IVAR,
-            Rc::into_raw(input_regions.clone()).cast_mut().cast::<c_void>(),
+            Rc::into_raw(input_regions.clone())
+                .cast_mut()
+                .cast::<c_void>(),
         );
     }
 

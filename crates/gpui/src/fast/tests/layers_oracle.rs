@@ -37,7 +37,7 @@ use crate::{
     KeyDownEvent, LayerFrame, LayerKey, ListAlignment, ListOffset, ListState, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NoopTextSystem, ParentElement as _,
     Pixels, PlatformInput, Point, PolychromeSprite, Quad, Render, ScaledPixels, Scene, ScrollDelta,
-    ScrollHandle, ScrollStrategy, ScrollEvent, SharedString, StatefulInteractiveElement as _,
+    ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement as _,
     Styled as _, TestAppContext, TileCoord, TouchPhase, UniformListScrollHandle, Window,
     WindowHandle, canvas, div, hsla, layer_tile_id, layer_tile_texture_id, list, point, px, rgba,
     size, uniform_list, util::FluentBuilder as _, white,
@@ -657,6 +657,7 @@ fn apply(cx: &mut TestAppContext, window: WindowHandle<LayerOracleView>, change:
                 delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
                 modifiers: Modifiers::default(),
                 touch_phase: TouchPhase::Moved,
+                source: crate::ScrollSource::Pointer,
             }
             .to_platform_input(),
         ),

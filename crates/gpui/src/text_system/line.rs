@@ -548,9 +548,11 @@ fn paint_line(
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let underline_y_offset = underline_y_offset(line_height, layout.ascent, layout.descent);
-        let mut decoration_runs = decoration_runs.iter();
+        let all_decoration_runs = decoration_runs;
+        let mut decoration_runs = all_decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
+        let mut current_run_start = 0;
         let mut color = black();
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
@@ -635,6 +637,12 @@ fn paint_line(
                 let mut finished_underline: Option<(Point<Pixels>, UnderlineStyle, Range<usize>)> =
                     None;
                 let mut finished_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
+                // Right-to-left glyphs come in visual order, so a glyph's byte index can fall
+                // before the style run found for the glyph painted before it.
+                if glyph.index < current_run_start {
+                    decoration_runs = all_decoration_runs.iter();
+                    run_end = 0;
+                }
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -649,6 +657,7 @@ fn paint_line(
 
                     if let Some(style_run) = style_run {
                         let style_run_start = run_end;
+                        current_run_start = style_run_start;
                         if let Some((_, underline_style, underline_range)) = &mut current_underline
                         {
                             if style_run.underline.as_ref() != Some(underline_style) {
@@ -819,9 +828,11 @@ fn paint_line_background(
         wrap_boundaries,
     );
     window.paint_layer(line_bounds, |window| {
-        let mut decoration_runs = decoration_runs.iter();
+        let all_decoration_runs = decoration_runs;
+        let mut decoration_runs = all_decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
+        let mut current_run_start = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
         let text_system = cx.text_system().clone();
         let mut glyph_origin = point(
@@ -878,6 +889,11 @@ fn paint_line_background(
                 prev_glyph_position = glyph.position;
 
                 let mut finished_background: Option<(Point<Pixels>, Hsla)> = None;
+                // See `paint_line`: right-to-left glyphs can step back in byte order.
+                if glyph.index < current_run_start {
+                    decoration_runs = all_decoration_runs.iter();
+                    run_end = 0;
+                }
                 if glyph.index >= run_end {
                     let mut style_run = decoration_runs.next();
 
@@ -891,6 +907,7 @@ fn paint_line_background(
                     }
 
                     if let Some(style_run) = style_run {
+                        current_run_start = run_end;
                         if let Some((_, background_color)) = &mut current_background
                             && style_run.background_color.as_ref() != Some(background_color)
                         {

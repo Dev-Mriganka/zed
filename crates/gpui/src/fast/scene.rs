@@ -187,6 +187,12 @@ impl Scene {
                     lines.push(format!("rounded clip {clip:?}"))
                 }
                 crate::PaintOperation::Primitive(..) => {}
+                #[cfg(target_os = "macos")]
+                crate::PaintOperation::StartEffect { bounds, .. } => {
+                    lines.push(format!("effect {bounds:?}"))
+                }
+                #[cfg(target_os = "macos")]
+                crate::PaintOperation::EndEffect => lines.push("end effect".into()),
             }
         }
         lines.extend(self.shadows.iter().map(|shadow| format!("{shadow:?}")));

@@ -1498,6 +1498,13 @@ mod font_resolution_tests {
             font_ids.insert(requested.clone(), missing.clone());
             for fallback in &text_system.fallback_font_stack {
                 font_ids.insert(fallback.clone(), missing.clone());
+                // gpui-fast: a fallback is tried in the weight, style and features asked for
+                // before it is tried plain (`crate::fast::text::find_fallback`).
+                let fast_as_asked = Font {
+                    family: fallback.family.clone(),
+                    ..requested.clone()
+                };
+                font_ids.insert(fast_as_asked, missing.clone());
             }
             font_ids.insert(font("Arial"), CachedFont::Direct(FontId(42)));
         }

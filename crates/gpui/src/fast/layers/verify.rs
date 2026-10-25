@@ -65,6 +65,8 @@ fn clip_to(primitive: &mut Primitive, mask: &Bounds<ScaledPixels>) {
         Primitive::SubpixelSprite(p) => &mut p.content_mask,
         Primitive::PolychromeSprite(p) => &mut p.content_mask,
         Primitive::Surface(p) => &mut p.content_mask,
+        #[cfg(target_os = "macos")]
+        Primitive::Effect(p) => &mut p.content_mask,
     };
     content_mask.bounds = content_mask.bounds.intersect(mask);
 }
@@ -96,6 +98,9 @@ fn expand_layer(
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut scratch, clip.translated(translation))
             }
+            // A layer draws an effect's content plain; see `paint::draw_into_frame`.
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
         }
     }
     scratch.finish();
@@ -225,6 +230,8 @@ fn describe(primitive: &Primitive) -> String {
             }
         ),
         Primitive::Surface(p) => format!("surface {:?} {:?}", p.bounds, p.content_mask),
+        #[cfg(target_os = "macos")]
+        Primitive::Effect(p) => format!("effect {:?} {:?}", p.bounds, p.content_mask),
     }
 }
 

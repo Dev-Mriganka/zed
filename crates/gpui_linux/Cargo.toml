@@ -65,6 +65,8 @@ gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
 http_client.workspace = true
 libc.workspace = true
 log.workspace = true
+image.workspace = true
+serde_json.workspace = true
 parking_lot.workspace = true
 smallvec.workspace = true
 smol.workspace = true
@@ -117,6 +119,7 @@ x11rb = { version = "0.13.1", features = [
     "allow-unsafe-code",
     "xkb",
     "randr",
+    "dpms",
     "xinput",
     "cursor",
     "resource_manager",

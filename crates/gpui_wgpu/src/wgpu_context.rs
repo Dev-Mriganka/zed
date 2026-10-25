@@ -434,7 +434,9 @@ impl WgpuContext {
         }
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
-        #[cfg(target_family = "wasm")]
+        // GL is WebGL2 in a browser and GLES through EGL on Android (and Linux as a fallback). Both
+        // have WebGL2's limits: no storage buffers in the vertex stage, so the downlevel defaults
+        // are refused and device creation fails.
         let required_limits = if adapter.get_info().backend == wgpu::Backend::Gl {
             wgpu::Limits::downlevel_webgl2_defaults()
                 .using_resolution(adapter.limits())
@@ -444,10 +446,6 @@ impl WgpuContext {
                 .using_resolution(adapter.limits())
                 .using_alignment(adapter.limits())
         };
-        #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -726,8 +724,14 @@ impl WgpuContext {
         self.backend
     }
 
+    /// Whether instances go through the WebGL2-compatible path (uniform-buffer instance data, no
+    /// dual-source blending): WebGL2 in a browser and native GLES share its limits.
     pub fn uses_webgl_instance_data(&self) -> bool {
-        matches!(self.backend, WgpuBackend::Gl) && cfg!(target_family = "wasm")
+        match self.backend {
+            WgpuBackend::Gl => cfg!(target_family = "wasm"),
+            WgpuBackend::Native(wgpu::Backend::Gl) => true,
+            _ => false,
+        }
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {

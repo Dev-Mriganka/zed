@@ -14,3 +14,6 @@ pub use wgpu_context::*;
 ))]
 pub use wgpu_renderer::WgpuHeadlessRenderer;
 pub use wgpu_renderer::{GpuContext, WgpuRenderer, WgpuSurfaceConfig};
+
+mod glass;
+pub use glass::{GlassFrame, GlassImage, GlassSource};

@@ -1151,6 +1151,7 @@ struct MonochromeSpriteVertexOutput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 tile_texel_bounds: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -1158,8 +1159,21 @@ struct MonochromeSpriteFragmentInput {
     float4 position: SV_Position;
     float2 tile_position: POSITION;
     nointerpolation float4 color: COLOR;
+    nointerpolation float4 tile_texel_bounds: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
+
+// Atlas tiles are packed with no gutter, so a bilinear sample within half a texel of a tile's
+// edge blends in the neighbouring tile. Unrotated sprites never sample that close, but a rotated
+// or scaled one does along its whole outline, which showed as a flickering square around spinning
+// icons. Clamping to the centres of the tile's edge texels keeps every sample inside the tile.
+float4 tile_texel_bounds(AtlasTile tile) {
+    float2 atlas_size;
+    t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+    float2 origin = float2(tile.bounds.origin);
+    float2 size = float2(tile.bounds.size);
+    return float4((origin + 0.5) / atlas_size, (origin + size - 0.5) / atlas_size);
+}
 
 StructuredBuffer<MonochromeSprite> mono_sprites: register(t1);
 
@@ -1177,12 +1191,14 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
     output.position = device_position;
     output.tile_position = tile_position;
     output.color = color;
+    output.tile_texel_bounds = tile_texel_bounds(sprite.tile);
     output.clip_distance = clip_distance;
     return output;
 }
 
 float4 monochrome_sprite_fragment(MonochromeSpriteFragmentInput input): SV_Target {
-    float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
+    float2 tile_position = clamp(input.tile_position, input.tile_texel_bounds.xy, input.tile_texel_bounds.zw);
+    float sample = t_sprite.Sample(s_sprite, tile_position).r;
     float alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, grayscale_enhanced_contrast, gamma_ratios);
     return float4(input.color.rgb, input.color.a * alpha_corrected);
 }

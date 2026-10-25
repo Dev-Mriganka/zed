@@ -34,6 +34,51 @@ use gpui::*;
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
+impl WindowsWindow {
+    /// Ghostex: changes what this window asked its backdrop for and redraws it.
+    fn update_backdrop(&self, change: impl FnOnce(&mut BackdropRequest)) {
+        let hwnd = self.0.hwnd;
+        let active = {
+            let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+                log::error!("Window backdrop changed while the window was drawing");
+                return;
+            };
+            let mut request = renderer.backdrop().request().clone();
+            change(&mut request);
+            if *renderer.backdrop().request() == request {
+                return;
+            }
+            renderer.update_backdrop(request, placement_for(hwnd))
+        };
+        track_window(hwnd, Rc::downgrade(&self.0), active);
+    }
+}
+
+impl WindowsWindowInner {
+    /// Ghostex: lays the backdrop out again after the window moved, resized or changed monitor.
+    pub(crate) fn refresh_backdrop(&self) {
+        let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+            return;
+        };
+        let request = renderer.backdrop().request().clone();
+        if !request.blurred || !request.wallpaper {
+            return;
+        }
+        renderer.update_backdrop(request, placement_for(self.hwnd));
+    }
+
+    /// Ghostex: Windows reported a new desktop wallpaper.
+    pub(crate) fn backdrop_wallpaper_changed(&self) {
+        let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+            return;
+        };
+        let request = renderer.backdrop().request();
+        if request.blurred && request.wallpaper && request.image.is_none() {
+            renderer.backdrop_wallpaper_changed();
+        }
+    }
+}
+
 impl std::ops::Deref for WindowsWindow {
     type Target = WindowsWindowInner;
 
@@ -50,6 +95,8 @@ pub struct WindowsWindowState {
     pub border_offset: WindowBorderOffset,
     pub appearance: Cell<WindowAppearance>,
     pub background_appearance: Cell<WindowBackgroundAppearance>,
+    /// Ghostex: how a blurred window blurs what is behind it (`set_whole_window_blur`).
+    pub(crate) behind_window_blur: Cell<BehindWindowBlur>,
     pub scale_factor: Cell<f32>,
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
@@ -62,6 +109,9 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    /// The client position (`WM_MOUSEMOVE` lparam) and pressed button of the last mouse move
+    /// GPUI was told about; cleared when the pointer leaves the window.
+    pub last_mouse_move: Cell<Option<(isize, Option<MouseButton>)>>,
     pub last_visibility: Cell<Option<WindowVisibility>>,
     pub direct_manipulation: DirectManipulationHandler,
 
@@ -91,6 +141,8 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+    /// Ghostex: the blur windows under a frosted surface's rounded rects.
+    pub(crate) frosted_backdrops: FrostedBackdrops,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -168,6 +220,7 @@ impl WindowsWindowState {
             border_offset,
             appearance: Cell::new(appearance),
             background_appearance: Cell::new(WindowBackgroundAppearance::Opaque),
+            behind_window_blur: Cell::new(BehindWindowBlur::System),
             scale_factor: Cell::new(scale_factor),
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
@@ -180,6 +233,7 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            last_mouse_move: Cell::new(None),
             last_visibility: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
@@ -195,6 +249,7 @@ impl WindowsWindowState {
             draw_coordinator,
             direct_manipulation,
             a11y: RefCell::new(None),
+            frosted_backdrops: FrostedBackdrops::default(),
         })
     }
 
@@ -410,7 +465,8 @@ pub(crate) struct Callbacks {
     pub(crate) display_changed: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) should_close: Cell<Option<Box<dyn FnMut() -> bool>>>,
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
-    pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
+    pub(crate) hit_test_window_control:
+        Cell<Option<Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -464,6 +520,12 @@ impl WindowsWindow {
             invalidate_devices,
             draw_coordinator,
         } = creation_info;
+        // CDXC:PlatformSupport 2026-09-18 WHY:
+        // GPUI_DISABLE_DIRECT_COMPOSITION is for windows that host child HWNDs (windowed CEF), which DWM can only composite into a redirection bitmap.
+        // That path presents through CreateSwapChainForHwnd with DXGI_ALPHA_MODE_IGNORE, so transparent and blurred popups drew solid black where they should show through.
+        // Only opaque windows honour the disable; windows that need per-pixel alpha keep DirectComposition, as they already get alpha on macOS.
+        let disable_direct_composition = disable_direct_composition
+            && params.window_background == WindowBackgroundAppearance::Opaque;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
@@ -479,6 +541,12 @@ impl WindowsWindow {
         } else {
             None
         };
+        let native_owner_hwnd = if params.kind == WindowKind::PopUp {
+            let owner_window = unsafe { GetActiveWindow() };
+            (!owner_window.is_invalid()).then_some(owner_window)
+        } else {
+            parent_hwnd
+        };
         let hide_title_bar = params
             .titlebar
             .as_ref()
@@ -493,8 +561,17 @@ impl WindowsWindow {
                 .unwrap_or(""),
         );
 
+        // CDXC:PlatformSupport 2026-10-04 WHY:
+        // An owned window always stays above its owner, so `WS_EX_TOPMOST` on an owned pop-up only made it float over every other app's windows: Ghostex's menus, tooltips and the chat's scroll-to-bottom pill stayed on screen after Alt+Tab. An owned pop-up now goes behind other apps together with its owner; a pop-up opened with no active window (a capture overlay summoned over another app) has nothing to ride with and stays topmost.
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW | WS_EX_TOPMOST, WINDOW_STYLE(0x0))
+            let mut dwexstyle = WS_EX_TOOLWINDOW;
+            if native_owner_hwnd.is_none() {
+                dwexstyle |= WS_EX_TOPMOST;
+            }
+            if !params.focus {
+                dwexstyle |= WS_EX_NOACTIVATE;
+            }
+            (dwexstyle, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
 
@@ -560,7 +637,7 @@ impl WindowsWindow {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                parent_hwnd,
+                native_owner_hwnd,
                 None,
                 Some(hinstance.into()),
                 Some(&context as *const _ as *const _),
@@ -612,9 +689,30 @@ impl rwh::HasDisplayHandle for WindowsWindow {
     }
 }
 
+/// Ghostex: before an active owned window hides, activation moves to its nearest visible owner.
+/// Windows otherwise hands it to the next window in z-order, which is often another app's: closing
+/// or reopening a menu pop-up brought that app in front of Ghostex. Only an active window hands
+/// anything over, so a pop-up closed by a click elsewhere leaves activation where the click put it.
+fn hand_activation_to_owner(hwnd: HWND) {
+    unsafe {
+        if GetActiveWindow() != hwnd {
+            return;
+        }
+        let mut owner = GetWindow(hwnd, GW_OWNER).ok();
+        while let Some(candidate) = owner.filter(|owner| !owner.is_invalid()) {
+            if IsWindowVisible(candidate).as_bool() && !IsIconic(candidate).as_bool() {
+                SetActiveWindow(candidate).log_err();
+                return;
+            }
+            owner = GetWindow(candidate, GW_OWNER).ok();
+        }
+    }
+}
+
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
         self.0.dialog_owner.close();
+        hand_activation_to_owner(self.0.hwnd);
         unsafe { ShowWindowAsync(self.0.hwnd, SW_HIDE).ok().log_err() };
         // `DestroyWindow` below sends `WM_SHOWWINDOW`; without a callback the
         // resulting visibility report has nothing to notify.
@@ -656,6 +754,8 @@ impl PlatformWindow for WindowsWindow {
         self.state.content_size()
     }
 
+    /// CDXC:PlatformSupport 2026-09-23 WHY:
+    /// Resizing a hover-reveal popup must preserve focus and stacking. SetWindowPos otherwise activates and raises it on every animation frame, dismissing the reveal when its main window loses focus and stealing keys from the intended window.
     fn resize(&mut self, size: Size<Pixels>) {
         let hwnd = self.0.hwnd;
         let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
@@ -672,7 +772,7 @@ impl PlatformWindow for WindowsWindow {
                         bounds.origin.y.0,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                     .context("unable to set window content size")
                     .log_err();
@@ -926,12 +1026,25 @@ impl PlatformWindow for WindowsWindow {
         match background_appearance {
             WindowBackgroundAppearance::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
+                // DWMSBT_NONE: drops a system acrylic a blurred window had.
+                dwm_set_window_composition_attribute(hwnd, 1);
             }
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
+                dwm_set_window_composition_attribute(hwnd, 1);
             }
+            // Ghostex: a frosted surface's blur is drawn by its blur windows, so the surface
+            // itself stays clear; any other blurred window blurs its whole rectangle.
             WindowBackgroundAppearance::Blurred => {
-                set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+                if self
+                    .state
+                    .frosted_backdrops
+                    .set(hwnd, None, true, self.state.scale_factor.get())
+                {
+                    clear_window_blur(hwnd);
+                } else {
+                    set_whole_window_blur(hwnd, self.state.behind_window_blur.get());
+                }
             }
             WindowBackgroundAppearance::MicaBackdrop => {
                 // DWMSBT_MAINWINDOW => MicaBase
@@ -942,6 +1055,129 @@ impl PlatformWindow for WindowsWindow {
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
         }
+        // Ghostex: leaving Blurred takes a frosted surface's blur windows away.
+        if background_appearance != WindowBackgroundAppearance::Blurred {
+            self.state
+                .frosted_backdrops
+                .set(hwnd, None, false, self.state.scale_factor.get());
+        }
+        self.update_backdrop(|request| {
+            request.blurred = background_appearance == WindowBackgroundAppearance::Blurred;
+        });
+    }
+
+    fn set_background_wallpaper(&self, wallpaper: bool) {
+        self.update_backdrop(|request| request.wallpaper = wallpaper);
+    }
+
+    fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        self.update_backdrop(|request| request.image = image);
+    }
+
+    fn set_background_wallpaper_follows_screen(&self, follows_screen: bool) {
+        self.update_backdrop(|request| request.follows_screen = follows_screen);
+    }
+
+    fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        self.update_backdrop(|request| request.cover = cover);
+    }
+
+    fn set_background_live(&self, live: Option<gpui::LiveBackground>) {
+        self.update_backdrop(|request| request.live = live);
+    }
+
+    // Ghostex: the radius the backdrop blurs its pictures by. DWM's own behind-window blur has no
+    // radius to set, and the backdrop keeps the picture's saturation either way.
+    fn set_background_blur_style(&self, radius: Pixels, _keep_saturation: bool) {
+        let radius = f32::from(radius);
+        self.update_backdrop(|request| {
+            request.blur_radius = radius.is_finite().then_some(radius.max(0.0))
+        });
+    }
+
+    // Ghostex: the blur behind a blurred window, which DWM draws with no radius to set: its system
+    // acrylic, the older acrylic accent without the system acrylic's frost, or none.
+    fn set_background_behind_window_blur(&self, blur: BehindWindowBlur) {
+        if self.state.behind_window_blur.replace(blur) != blur
+            && self.state.background_appearance.get() == WindowBackgroundAppearance::Blurred
+        {
+            self.set_background_appearance(WindowBackgroundAppearance::Blurred);
+        }
+    }
+
+    // Ghostex: a frosted surface keeps its blur, and everything it draws, inside the rounded rects
+    // it reports each frame (a tooltip host is exactly its bubble, a toast stack its cards). DWM
+    // draws a window's acrylic over its whole rectangle whatever its region, so the blur moves to
+    // a rounded blur window per rect (`frosted_backdrop.rs`) and the window's own accent turns
+    // clear; the window's region, their union, still clips what it draws and where it takes the
+    // mouse. An empty list gives the whole window, and its own blur, back.
+    fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
+        let hwnd = self.0.hwnd;
+        let scale = self.state.scale_factor.get();
+        if self.state.background_appearance.get() == WindowBackgroundAppearance::Blurred {
+            let backdrops =
+                self.state
+                    .frosted_backdrops
+                    .set(hwnd, Some(region.clone()), true, scale);
+            if backdrops {
+                clear_window_blur(hwnd);
+            } else {
+                set_whole_window_blur(hwnd, self.state.behind_window_blur.get());
+            }
+        } else {
+            self.state
+                .frosted_backdrops
+                .set(hwnd, Some(region.clone()), false, scale);
+        }
+        unsafe {
+            if region.is_empty() {
+                SetWindowRgn(hwnd, None, true);
+                return;
+            }
+            let mut combined: Option<HRGN> = None;
+            for (bounds, radius) in region {
+                let device = bounds.to_device_pixels(scale);
+                let left = device.origin.x.0;
+                let top = device.origin.y.0;
+                let right = left + device.size.width.0;
+                let bottom = top + device.size.height.0;
+                let diameter = (f32::from(radius) * scale * 2.0).round() as i32;
+                let rect = CreateRoundRectRgn(left, top, right + 1, bottom + 1, diameter, diameter);
+                match combined {
+                    None => combined = Some(rect),
+                    Some(union) => {
+                        CombineRgn(Some(union), Some(union), Some(rect), RGN_OR);
+                        let _ = DeleteObject(rect.into());
+                    }
+                }
+            }
+            if let Some(union) = combined
+                && SetWindowRgn(hwnd, Some(union), true) == 0
+            {
+                // The system owns the region only once SetWindowRgn accepts it.
+                let _ = DeleteObject(union.into());
+            }
+        }
+    }
+
+    // Ghostex: DWM rounds a window to one of two fixed radii (Windows 11 only; Windows 10 keeps
+    // square corners), so the requested radius picks the nearer one.
+    fn set_background_corner_radius(&self, radius: Pixels) {
+        let preference = if radius <= px(0.0) {
+            DWMWCP_DONOTROUND
+        } else if radius < px(6.0) {
+            DWMWCP_ROUNDSMALL
+        } else {
+            DWMWCP_ROUND
+        };
+        let _ = unsafe {
+            DwmSetWindowAttribute(
+                self.0.hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                &preference as *const _ as *const _,
+                std::mem::size_of_val(&preference) as u32,
+            )
+        };
     }
 
     fn minimize(&self) {
@@ -1029,7 +1265,10 @@ impl PlatformWindow for WindowsWindow {
         self.state.callbacks.close.set(Some(callback));
     }
 
-    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+    fn on_hit_test_window_control(
+        &self,
+        callback: Box<dyn FnMut(gpui::Point<gpui::Pixels>) -> Option<WindowControlArea>>,
+    ) {
         self.0
             .state
             .callbacks
@@ -1529,7 +1768,7 @@ pub(crate) fn window_from_hwnd(hwnd: HWND) -> Option<Rc<WindowsWindowInner>> {
     }
 }
 
-fn get_module_handle() -> HMODULE {
+pub(crate) fn get_module_handle() -> HMODULE {
     unsafe {
         let mut h_module = std::mem::zeroed();
         GetModuleHandleExW(
@@ -1631,6 +1870,66 @@ fn retrieve_window_placement(
     Ok(placement)
 }
 
+/// Ghostex: blurs the window's whole rectangle with the system acrylic (DWMSBT_TRANSIENTWINDOW)
+/// where Windows has it, else with the legacy acrylic accent. The legacy accent made Windows
+/// recompose the window's blur slowly on every frame it drew: a 4K window at 240 Hz drew a
+/// sidebar slide at ~25 ms a frame with it, ~10 ms opaque or over a drawn wallpaper.
+///
+/// `BehindWindowBlur::Plain` asks for that legacy accent anyway: the same blur without the system
+/// acrylic's grey frost, so the app's own tint is the only layer over it. `Off` leaves the window
+/// clear (the transparent-gradient accent), which costs no blur at all.
+///
+/// CDXC:Theming 2026-10-16 WHY:
+/// DWM gives a window's behind-window blur no radius on any Windows version: the system backdrops
+/// (Mica, Mica Alt, Acrylic) and the accents (ACCENT_ENABLE_BLURBEHIND, ACCENT_ENABLE_ACRYLICBLURBEHIND)
+/// each draw one fixed blur, and on Windows 11 the blur-behind accent draws the acrylic accent's
+/// blur. Drawing a radius ourselves would need the screen behind the window captured with the
+/// window left out, which only WDA_EXCLUDEFROMCAPTURE allows, and that hides Ghostex from every
+/// screenshot and screen share.
+fn set_whole_window_blur(hwnd: HWND, blur: BehindWindowBlur) {
+    match blur {
+        BehindWindowBlur::System if system_backdrop_available() => {
+            set_window_composition_attribute(hwnd, None, 0);
+            dwm_set_window_composition_attribute(hwnd, 3);
+        }
+        BehindWindowBlur::System | BehindWindowBlur::Plain => {
+            dwm_set_window_composition_attribute(hwnd, 1);
+            set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
+        }
+        BehindWindowBlur::Off => clear_window_blur(hwnd),
+    }
+}
+
+/// Ghostex: whether the window lies to DWM that it is still active when it loses focus
+/// (`handle_nc_activate_msg`).
+///
+/// CDXC:Theming 2026-10-16 WHY:
+/// DWM paints the system acrylic of an inactive window as a flat grey fill, so with Desktop and
+/// windows the glass went solid grey whenever another app had focus and no tint setting changed
+/// it. A window blurred by the system acrylic therefore keeps its frame drawn as active; the
+/// legacy accents keep their blur while inactive on their own.
+pub(crate) fn keeps_system_backdrop_when_inactive(state: &WindowsWindowState) -> bool {
+    state.background_appearance.get() == WindowBackgroundAppearance::Blurred
+        && state.behind_window_blur.get() == BehindWindowBlur::System
+        && system_backdrop_available()
+}
+
+/// Ghostex: no blur of the window's own: a frosted surface whose rounded blur windows draw its
+/// blur (`frosted_backdrop.rs`). DWM draws a window's acrylic, accent or system backdrop, over its
+/// whole rectangle whatever its region, so either one left on shows a square blur behind the
+/// surface's rounded cards.
+fn clear_window_blur(hwnd: HWND) {
+    set_window_composition_attribute(hwnd, None, 2);
+    dwm_set_window_composition_attribute(hwnd, 1);
+}
+
+/// Whether DWMWA_SYSTEMBACKDROP_TYPE is available (Windows 11 22H2, build 22621, or later).
+fn system_backdrop_available() -> bool {
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    status.is_ok() && version.dwBuildNumber >= 22621
+}
+
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
@@ -1655,7 +1954,7 @@ fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
     }
 }
 
-fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
+pub(crate) fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
     let mut version = unsafe { std::mem::zeroed() };
     let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
 

@@ -228,6 +228,14 @@ fn content_in_parts_draws_each_tile_as_one_scene_does() {
             PaintOperation::FastRoundedClip(clip) => {
                 crate::fast::rounded_clip::record(&mut whole, *clip)
             }
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect {
+                effect,
+                bounds,
+                content_mask,
+            } => whole.push_effect(effect.clone(), *bounds, *content_mask),
+            #[cfg(target_os = "macos")]
+            PaintOperation::EndEffect => whole.pop_effect(),
         }
     }
     whole.finish();
@@ -243,6 +251,18 @@ fn content_in_parts_draws_each_tile_as_one_scene_does() {
                 PaintOperation::StartLayer(bounds) => PaintOperation::StartLayer(*bounds),
                 PaintOperation::EndLayer => PaintOperation::EndLayer,
                 PaintOperation::FastRoundedClip(clip) => PaintOperation::FastRoundedClip(*clip),
+                #[cfg(target_os = "macos")]
+                PaintOperation::StartEffect {
+                    effect,
+                    bounds,
+                    content_mask,
+                } => PaintOperation::StartEffect {
+                    effect: effect.clone(),
+                    bounds: *bounds,
+                    content_mask: *content_mask,
+                },
+                #[cfg(target_os = "macos")]
+                PaintOperation::EndEffect => PaintOperation::EndEffect,
             })
             .collect();
         LayerPart {
@@ -1773,9 +1793,9 @@ mod invalidation {
     use crate::fast::layers::invalidate::{ScrollSource, render_read_offset, scrolled};
     use crate::{
         AnyWindowHandle, App, AppContext as _, Context, Entity, GlobalElementId,
-        InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollDelta,
-        ScrollHandle, ScrollEvent, StatefulInteractiveElement as _, Styled as _,
-        TestAppContext, TouchPhase, Window, div, point, px, rgb,
+        InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollDelta, ScrollEvent,
+        ScrollHandle, StatefulInteractiveElement as _, Styled as _, TestAppContext, TouchPhase,
+        Window, div, point, px, rgb,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -1858,6 +1878,7 @@ mod invalidation {
                     delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                     modifiers: Default::default(),
                     touch_phase: TouchPhase::Moved,
+                    source: crate::ScrollSource::Pointer,
                 }),
                 cx,
             );
@@ -2074,7 +2095,7 @@ mod decisions {
     use crate::{
         AnyElement, AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity,
         GlobalElementId, Hsla, InteractiveElement as _, IntoElement, MouseMoveEvent,
-        ParentElement as _, Pixels, Render, ScrollDelta, ScrollHandle, ScrollEvent,
+        ParentElement as _, Pixels, Render, ScrollDelta, ScrollEvent, ScrollHandle,
         StatefulInteractiveElement as _, Styled as _, TestAppContext, TouchPhase, Window,
         WindowHandle, canvas, div, point, px, rgb, size,
     };
@@ -2274,6 +2295,7 @@ mod decisions {
                         delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );
@@ -2444,6 +2466,7 @@ mod decisions {
                         delta: ScrollDelta::Pixels(point(px(0.), px(-20.))),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );
@@ -3197,7 +3220,7 @@ mod input {
         AnyWindowHandle, AppContext as _, Bounds, Context, DispatchPhase, FocusHandle,
         HitboxBehavior, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
-        ScrollDelta, ScrollHandle, ScrollEvent, StatefulInteractiveElement as _, Styled as _,
+        ScrollDelta, ScrollEvent, ScrollHandle, StatefulInteractiveElement as _, Styled as _,
         TestAppContext, TouchPhase, Window, WindowHandle, canvas, div, point, px, rgb,
     };
     use std::{
@@ -3345,6 +3368,7 @@ mod input {
                         delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                         modifiers: Default::default(),
                         touch_phase: TouchPhase::Moved,
+                        source: crate::ScrollSource::Pointer,
                     }),
                     cx,
                 );
@@ -4102,6 +4126,7 @@ mod integration {
                             delta: crate::ScrollDelta::Pixels(point(px(0.), px(dy))),
                             modifiers: Default::default(),
                             touch_phase: crate::TouchPhase::Moved,
+                            source: crate::ScrollSource::Pointer,
                         }),
                         cx,
                     );

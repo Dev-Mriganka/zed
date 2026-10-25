@@ -5,7 +5,7 @@ use crate::events::EventListenerHandle;
 use crate::http_client::FetchHttpClient;
 use crate::keyboard::WebKeyboardLayout;
 use crate::text_system::WebTextSystem;
-use crate::window::WebWindow;
+use crate::window::{WebWindow, WebWindowRole};
 use anyhow::Result;
 use futures::channel::oneshot;
 use gpui::{
@@ -16,7 +16,7 @@ use gpui::{
     PlatformTextSystem, PlatformWindow, ScrollPhysics, Task, ThermalState, WindowAppearance,
     WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
-use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuContext, wgpu};
+use gpui_wgpu::{PreparedWebGraphics, WebBackendPreference, WgpuBackend, WgpuContext, wgpu};
 use std::{
     cell::{Cell, RefCell},
     path::{Path, PathBuf},
@@ -36,7 +36,9 @@ pub struct WebPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    active_window: Rc<RefCell<Option<AnyWindowHandle>>>,
+    /// Every open window, in the order they were opened: the page's own window first, then its
+    /// overlay windows. The last one is on top and is the active window.
+    open_windows: Rc<RefCell<Vec<AnyWindowHandle>>>,
     active_display: Rc<dyn PlatformDisplay>,
     callbacks: RefCell<WebPlatformCallbacks>,
     backend_preference: WebBackendPreference,
@@ -97,6 +99,9 @@ pub(crate) enum WebWindowLifecycle {
 #[derive(Debug)]
 pub enum WebWindowError {
     AlreadyOpen,
+    /// A window opened while the page's window is open is an overlay canvas sharing the page
+    /// window's graphics device, which only WebGPU can do.
+    OverlayWindowsNeedWebGpu,
     ReopeningUnsupported,
     UnsupportedWindowKind(&'static str),
     /// Graphics initialization has not completed yet; retrying after it
@@ -112,6 +117,9 @@ impl std::fmt::Display for WebWindowError {
         match self {
             Self::AlreadyOpen => formatter.write_str(
                 "GPUI web supports only one top-level window; a window is already open",
+            ),
+            Self::OverlayWindowsNeedWebGpu => formatter.write_str(
+                "GPUI web opens further windows as overlay canvases, which needs WebGPU; the WebGL2 fallback supports only the page's window",
             ),
             Self::ReopeningUnsupported => formatter.write_str(
                 "reopening the GPUI web top-level window after it closes is not supported",
@@ -201,7 +209,7 @@ impl WebPlatform {
             background_executor,
             foreground_executor,
             text_system,
-            active_window: Rc::new(RefCell::new(None)),
+            open_windows: Rc::new(RefCell::new(Vec::new())),
             active_display,
             callbacks: RefCell::new(WebPlatformCallbacks::default()),
             backend_preference,
@@ -226,6 +234,57 @@ impl WebPlatform {
         user_agent: &str,
     ) -> anyhow::Result<FetchHttpClient> {
         FetchHttpClient::with_user_agent(self.dispatcher.clone(), user_agent)
+    }
+
+    /// Opens a window while the page's own window is open: an overlay canvas of the page, laid
+    /// over it at the window's bounds, whatever its kind. Its surface comes from the page window's
+    /// graphics context, which WebGPU allows for any number of canvases; a WebGL2 context belongs
+    /// to the one canvas it was created for, so the WebGL2 fallback cannot open one.
+    fn open_overlay_window(
+        &self,
+        handle: AnyWindowHandle,
+        params: WindowParams,
+    ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        let context_ref = self.wgpu_context.borrow();
+        let context = context_ref
+            .as_ref()
+            .ok_or(WebWindowError::GraphicsUnavailable)?;
+        if context.backend() != WgpuBackend::BrowserWebGpu {
+            return Err(WebWindowError::OverlayWindowsNeedWebGpu.into());
+        }
+        let canvas = WebWindow::prepare_overlay_canvas(&self.browser_window, params.bounds)?;
+        let surface = match context
+            .instance
+            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+        {
+            Ok(surface) => surface,
+            Err(error) => {
+                let element: &web_sys::Element = canvas.as_ref();
+                element.remove();
+                anyhow::bail!("Failed to create an overlay window surface: {error}");
+            }
+        };
+        let canvas_for_cleanup = canvas.clone();
+        match WebWindow::new(
+            handle,
+            params,
+            context,
+            canvas,
+            surface,
+            self.browser_window.clone(),
+            WebWindowRole::Overlay,
+            self.open_windows.clone(),
+        ) {
+            Ok(window) => {
+                self.open_windows.borrow_mut().push(handle);
+                Ok(Box::new(window))
+            }
+            Err(error) => {
+                let element: &web_sys::Element = canvas_for_cleanup.as_ref();
+                element.remove();
+                Err(error)
+            }
+        }
     }
 }
 
@@ -378,8 +437,22 @@ impl Platform for WebPlatform {
     // The browser is the only display, and it never changes.
     fn on_displays_changed(&self, _callback: Box<dyn FnMut()>) {}
 
+    /// The window holding the page's keyboard, else the one opened last. Reporting the last one
+    /// regardless kept an overlay popup "active" after a click on the page window under it took
+    /// the keyboard, so a popup that closes on click-away (Ghostex's chat model menu) stayed open.
     fn active_window(&self) -> Option<AnyWindowHandle> {
-        *self.active_window.borrow()
+        let open_windows = self.open_windows.borrow();
+        self.browser_window
+            .document()
+            .as_ref()
+            .and_then(crate::ime_mirror::focused_window_input)
+            .and_then(|id| {
+                open_windows
+                    .iter()
+                    .find(|handle| handle.window_id().as_u64() == id)
+                    .copied()
+            })
+            .or_else(|| open_windows.last().copied())
     }
 
     fn open_window(
@@ -387,6 +460,13 @@ impl Platform for WebPlatform {
         handle: AnyWindowHandle,
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        if let WindowKind::AnchoredPopup(_) = params.kind {
+            return Err(PopupNotSupportedError.into());
+        }
+        if self.window_lifecycle.get() == WebWindowLifecycle::Open {
+            return self.open_overlay_window(handle, params);
+        }
+
         match &params.kind {
             WindowKind::Normal => {}
             WindowKind::AnchoredPopup(_) => return Err(PopupNotSupportedError.into()),
@@ -431,13 +511,13 @@ impl Platform for WebPlatform {
             canvas,
             prepared_window.surface,
             self.browser_window.clone(),
-            self.window_lifecycle.clone(),
-            self.active_window.clone(),
+            WebWindowRole::Page(self.window_lifecycle.clone()),
+            self.open_windows.clone(),
         );
         match window {
             Ok(window) => {
                 self.window_lifecycle.set(WebWindowLifecycle::Open);
-                *self.active_window.borrow_mut() = Some(handle);
+                self.open_windows.borrow_mut().push(handle);
                 Ok(Box::new(window))
             }
             Err(error) => {
@@ -592,6 +672,8 @@ impl Platform for WebPlatform {
             CursorStyle::DragLink => "alias",
             CursorStyle::DragCopy => "copy",
             CursorStyle::ContextualMenu => "context-menu",
+            CursorStyle::ZoomIn => "zoom-in",
+            CursorStyle::ZoomOut => "zoom-out",
         };
 
         self.last_cursor_css.set(css_cursor);

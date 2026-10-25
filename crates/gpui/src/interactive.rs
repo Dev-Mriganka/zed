@@ -134,6 +134,14 @@ pub struct TouchEvent {
     pub predicted_position: Option<Point<Pixels>>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
+    /// When the platform sampled this touch, if it reports it (Android's
+    /// `MotionEvent.getEventTime()`, including batched historical samples).
+    ///
+    /// Gesture recognition times velocity, flings and long presses from it.
+    /// Without it the time the event is processed is used, and touches that
+    /// queued behind a slow frame arrive with compressed times, which can
+    /// turn a fling into a plain drag.
+    pub timestamp: Option<scheduler::Instant>,
 }
 
 impl Sealed for TouchEvent {}

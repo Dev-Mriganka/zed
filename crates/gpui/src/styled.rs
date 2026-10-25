@@ -524,6 +524,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Controls platform font smoothing for this element and its descendants.
+    /// Antialiasing remains enabled when stroke thickening is disabled.
+    fn font_smoothing(mut self, enabled: bool) -> Self {
+        self.text_style().font_smoothing = Some(enabled);
+        self
+    }
+
     /// Sets the background color of this element.
     ///
     /// This value cascades to its child elements.

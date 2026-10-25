@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintEffect, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, SceneBatch, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -24,7 +24,10 @@ use objc2_core_video::{
 };
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell, collections::HashMap, ffi::c_void, iter, mem, mem::MaybeUninit, ops::Range, ptr,
+    slice, sync::Arc,
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -39,6 +42,11 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
 const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// Bound cached pipelines and remembered failures across config reloads.
+const MAX_EFFECT_PIPELINE_CACHE_SIZE: usize = 64;
+/// Uniform uploads are padded to this so that an empty block still binds a
+/// buffer range Metal accepts.
+const MIN_EFFECT_UNIFORM_SIZE: usize = 16;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -138,6 +146,12 @@ pub struct MetalRenderer {
     pub(crate) path_intermediate_texture: Option<metal::Texture>,
     pub(crate) path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    effect_composite_pipeline_state: metal::RenderPipelineState,
+    effect_pass_vertex_function: metal::Function,
+    effect_sampler: metal::SamplerState,
+    effect_targets: HashMap<u64, EffectTarget>,
+    effect_pipelines: HashMap<Arc<str>, EffectPipeline>,
+    effect_frame: u64,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -392,6 +406,28 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        // Offscreen effect textures hold premultiplied colour, so they composite
+        // with the same blend state as path sprites.
+        let effect_composite_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "effect_composite",
+            "effect_composite_vertex",
+            "effect_composite_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let effect_pass_vertex_function = library
+            .get_function("effect_pass_vertex", None)
+            .expect("error locating vertex function");
+        let effect_sampler = {
+            // Shadertoy's defaults, which Ghostty's shaders are written against.
+            let descriptor = metal::SamplerDescriptor::new();
+            descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+            descriptor.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+            descriptor.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+            descriptor.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+            device.new_sampler(&descriptor)
+        };
 
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -439,6 +475,12 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            effect_composite_pipeline_state,
+            effect_pass_vertex_function,
+            effect_sampler,
+            effect_targets: HashMap::default(),
+            effect_pipelines: HashMap::default(),
+            effect_frame: 0,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
             fast_layers: crate::fast::layers::TileCache::default(),
@@ -467,12 +509,46 @@ impl MetalRenderer {
         }
     }
 
+    /// Ghostex: the path textures are not reallocated here. A live resize calls this for every
+    /// frame and most frames draw no path, so the textures are dropped and the next frame that
+    /// draws a path allocates them at its own size (`ensure_window_path_textures`).
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        self.update_path_intermediate_textures(size);
+        self.release_window_path_textures();
         crate::fast::layers::TileCache::clear(&mut self.fast_layers);
+    }
+
+    /// Ghostex: frees the window-sized path textures (about 4 bytes per drawable pixel, ~28 MB
+    /// for a full-screen Retina window) until a frame draws a path again. Called when the window
+    /// is resized and when it stops being visible (minimized, hidden, on another Space, covered).
+    pub fn release_window_path_textures(&mut self) {
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
+    }
+
+    /// Ghostex: allocates the window's path textures at `size` unless they already have it.
+    /// Called by a frame that draws paths, before it rasterizes them.
+    pub(crate) fn ensure_window_path_textures(&mut self, size: Size<DevicePixels>) {
+        let current = self
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| {
+                texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+            });
+        if !current {
+            self.update_path_intermediate_textures(size);
+        }
+    }
+
+    /// The window-sized textures paths drawn straight into the window, or
+    /// into a texture of its size, are rasterized through.
+    pub(crate) fn window_path_textures(&self) -> PathIntermediateTextures {
+        PathIntermediateTextures {
+            texture: self.path_intermediate_texture.clone(),
+            msaa_texture: self.path_intermediate_msaa_texture.clone(),
+        }
     }
 
     pub(crate) fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -485,32 +561,14 @@ impl MetalRenderer {
             return;
         }
 
-        let texture_descriptor = metal::TextureDescriptor::new();
-        texture_descriptor.set_width(size.width.0 as u64);
-        texture_descriptor.set_height(size.height.0 as u64);
-        texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-        texture_descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
-
-        if self.path_sample_count > 1 {
-            // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
-            // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
-            let storage_mode = if self.is_apple_gpu {
-                metal::MTLStorageMode::Memoryless
-            } else {
-                metal::MTLStorageMode::Private
-            };
-
-            let msaa_descriptor = texture_descriptor;
-            msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
-            msaa_descriptor.set_storage_mode(storage_mode);
-            msaa_descriptor.set_sample_count(self.path_sample_count as _);
-            self.path_intermediate_msaa_texture = Some(self.device.new_texture(&msaa_descriptor));
-        } else {
-            self.path_intermediate_msaa_texture = None;
-        }
+        let textures = new_path_intermediate_textures(
+            &self.device,
+            size,
+            self.path_sample_count,
+            self.is_apple_gpu,
+        );
+        self.path_intermediate_texture = textures.texture;
+        self.path_intermediate_msaa_texture = textures.msaa_texture;
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -591,13 +649,16 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
+        self.effect_frame += 1;
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
             &mut writer,
             texture,
             viewport_size,
-        )?;
+        );
+        self.retire_effect_resources();
+        let command_buffer = command_buffer?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -766,15 +827,77 @@ impl MetalRenderer {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
+        let path_textures = self.window_path_textures();
 
+        self.encode_scene(
+            scene,
+            instance_bindings,
+            writer,
+            command_buffer,
+            texture,
+            viewport_size,
+            metal::MTLClearColor::new(0., 0., 0., alpha),
+            &path_textures,
+        )?;
+
+        Ok(command_buffer.to_owned())
+    }
+
+    /// Encodes `scene` into `texture`, whose top-left corner is the scene's
+    /// origin. Leaves no render encoder open, including on error.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_scene(
+        &mut self,
+        scene: &Scene,
+        instance_bindings: &InstanceBindings,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        clear_color: metal::MTLClearColor,
+        path_textures: &PathIntermediateTextures,
+    ) -> Result<()> {
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             texture,
             viewport_size,
-            Some(metal::MTLClearColor::new(0., 0., 0., alpha)),
+            Some(clear_color),
         );
 
-        for batch in scene.batches() {
+        for batch in scene.scene_batches() {
+            let batch = match batch {
+                SceneBatch::Primitives(batch) => batch,
+                SceneBatch::Effect(effect_index) => {
+                    // The effect renders into its own textures, so the pass on
+                    // `texture` is closed and reopened (loading its contents)
+                    // around it, the same way paths are drawn.
+                    command_encoder.end_encoding();
+                    let effect = scene.effects.get(effect_index);
+                    let output = match effect {
+                        Some(effect) => self.render_effect(effect, writer, command_buffer)?,
+                        None => None,
+                    };
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                    if let (Some(effect), Some(output)) = (effect, output) {
+                        if let Err(error) = self.composite_effect(
+                            effect,
+                            &output,
+                            writer,
+                            viewport_size,
+                            command_encoder,
+                        ) {
+                            command_encoder.end_encoding();
+                            return Err(error);
+                        }
+                    }
+                    continue;
+                }
+            };
             match batch {
                 PrimitiveBatch::Shadows(range) => {
                     self.draw_shadows(range, instance_bindings, viewport_size, command_encoder)
@@ -791,6 +914,7 @@ impl MetalRenderer {
                         writer,
                         viewport_size,
                         command_buffer,
+                        path_textures,
                     )?;
 
                     command_encoder = new_command_encoder_for_texture(
@@ -806,6 +930,7 @@ impl MetalRenderer {
                             writer,
                             viewport_size,
                             command_encoder,
+                            path_textures,
                         ) {
                             command_encoder.end_encoding();
                             return Err(error);
@@ -844,7 +969,7 @@ impl MetalRenderer {
 
         command_encoder.end_encoding();
 
-        Ok(command_buffer.to_owned())
+        Ok(())
     }
 
     pub(crate) fn draw_paths_to_intermediate(
@@ -853,12 +978,13 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_buffer: &metal::CommandBufferRef,
+        path_textures: &PathIntermediateTextures,
     ) -> Result<bool> {
         if paths.is_empty() {
             return Ok(false);
         }
-        let intermediate_texture = self
-            .path_intermediate_texture
+        let intermediate_texture = path_textures
+            .texture
             .as_ref()
             .context("missing path intermediate texture")?;
 
@@ -881,7 +1007,7 @@ impl MetalRenderer {
         color_attachment.set_load_action(metal::MTLLoadAction::Clear);
         color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
 
-        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+        if let Some(msaa_texture) = &path_textures.msaa_texture {
             color_attachment.set_texture(Some(msaa_texture));
             color_attachment.set_resolve_texture(Some(intermediate_texture));
             color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
@@ -1007,12 +1133,13 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
+        path_textures: &PathIntermediateTextures,
     ) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
-        let intermediate_texture = self
-            .path_intermediate_texture
+        let intermediate_texture = path_textures
+            .texture
             .as_ref()
             .context("missing path intermediate texture")?;
 
@@ -1330,6 +1457,433 @@ impl MetalRenderer {
             );
         }
     }
+
+    /// Renders the effect's captured scene into its offscreen texture, runs
+    /// the shader passes over it, and returns the texture holding the result.
+    /// Must be called with no render encoder open on `command_buffer`.
+    fn render_effect(
+        &mut self,
+        effect: &PaintEffect,
+        writer: &mut InstanceBufferWriter,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> Result<Option<metal::Texture>> {
+        // Effect bounds are snapped to whole device pixels when painted, so the
+        // texture maps 1:1 onto the window.
+        let texture_size = size(
+            DevicePixels(effect.bounds.size.width.0.round() as i32),
+            DevicePixels(effect.bounds.size.height.0.round() as i32),
+        );
+        if texture_size.width.0 <= 0 || texture_size.height.0 <= 0 {
+            return Ok(None);
+        }
+        if texture_size.width.0 > gpui::MAX_SHADER_EFFECT_TEXTURE_SIZE
+            || texture_size.height.0 > gpui::MAX_SHADER_EFFECT_TEXTURE_SIZE
+        {
+            log::error!(
+                "skipping shader effect {}: {texture_size:?} exceeds the maximum texture size",
+                effect.effect.id
+            );
+            return Ok(None);
+        }
+
+        let pipelines: Vec<metal::RenderPipelineState> = effect
+            .effect
+            .shaders
+            .iter()
+            .map(|source| self.effect_pipeline(source))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+
+        let frame = self.effect_frame;
+        let device = &self.device;
+        let target = self
+            .effect_targets
+            .entry(effect.effect.id)
+            .or_insert_with(|| EffectTarget::new(device, texture_size));
+        if target.size != texture_size {
+            *target = EffectTarget::new(device, texture_size);
+        }
+        target.last_used_frame = frame;
+        if !effect.scene.paths.is_empty() && target.path_textures.texture.is_none() {
+            target.path_textures = new_path_intermediate_textures(
+                device,
+                texture_size,
+                self.path_sample_count,
+                self.is_apple_gpu,
+            );
+        }
+        let [mut input, mut output] = target.textures.clone();
+        let path_textures = target.path_textures.clone();
+
+        let local_scene = scene_in_effect_space(&effect.scene, effect.bounds.origin);
+        let instance_bindings = write_instances(&local_scene, writer)?;
+        self.encode_scene(
+            &local_scene,
+            &instance_bindings,
+            writer,
+            command_buffer,
+            &input,
+            texture_size,
+            metal::MTLClearColor::new(0., 0., 0., 0.),
+            &path_textures,
+        )?;
+
+        if pipelines.is_empty() {
+            return Ok(Some(input));
+        }
+
+        // The palette makes Ghostty's uniform block larger than the 4 KiB
+        // `set_fragment_bytes` allows, so it goes through the instance buffer,
+        // whose 256-byte offset alignment also suits constant buffers.
+        let uniforms =
+            write_padded_bytes(writer, &effect.effect.uniforms, MIN_EFFECT_UNIFORM_SIZE)?;
+        for pipeline in &pipelines {
+            let render_pass_descriptor = metal::RenderPassDescriptor::new();
+            let color_attachment = render_pass_descriptor
+                .color_attachments()
+                .object_at(0)
+                .context("missing color attachment")?;
+            color_attachment.set_texture(Some(&output));
+            color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+            color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+            let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+            command_encoder.set_render_pipeline_state(pipeline);
+            command_encoder.set_fragment_texture(0, Some(&input));
+            command_encoder.set_fragment_sampler_state(0, Some(&self.effect_sampler));
+            command_encoder.set_fragment_buffer(1, Some(&uniforms.buffer), uniforms.offset as u64);
+            command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+            command_encoder.end_encoding();
+
+            mem::swap(&mut input, &mut output);
+        }
+
+        Ok(Some(input))
+    }
+
+    fn composite_effect(
+        &self,
+        effect: &PaintEffect,
+        effect_texture: &metal::TextureRef,
+        writer: &mut InstanceBufferWriter,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> Result<()> {
+        let bounds_binding = writer.write(&[EffectCompositeBounds {
+            bounds: effect.bounds,
+            content_mask: effect.content_mask,
+        }])?;
+
+        command_encoder.set_render_pipeline_state(&self.effect_composite_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            EffectCompositeInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            EffectCompositeInputIndex::Bounds as u64,
+            Some(&bounds_binding.buffer),
+            bounds_binding.offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            EffectCompositeInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            EffectCompositeInputIndex::Texture as u64,
+            Some(effect_texture),
+        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        Ok(())
+    }
+
+    /// Returns the compiled pass for `source`, compiling it on first use.
+    /// Compile failures are cached as well, so a broken shader is reported
+    /// once instead of being recompiled every frame.
+    fn effect_pipeline(&mut self, source: &Arc<str>) -> Option<metal::RenderPipelineState> {
+        let frame = self.effect_frame;
+        if let Some(pipeline) = self.effect_pipelines.get_mut(source.as_ref()) {
+            pipeline.last_used_frame = frame;
+            return pipeline.state.clone();
+        }
+
+        let state = match self.compile_effect_pipeline(source) {
+            Ok(state) => Some(state),
+            Err(error) => {
+                log::error!("failed to compile shader effect pass; disabling the chain: {error:#}");
+                None
+            }
+        };
+        self.effect_pipelines.insert(
+            source.clone(),
+            EffectPipeline {
+                state: state.clone(),
+                last_used_frame: frame,
+            },
+        );
+        state
+    }
+
+    fn compile_effect_pipeline(&self, source: &str) -> Result<metal::RenderPipelineState> {
+        let library = self
+            .device
+            .new_library_with_source(source, &metal::CompileOptions::new())
+            .map_err(anyhow::Error::msg)
+            .context("compiling Metal source")?;
+        let fragment_function = library
+            .get_function("main0", None)
+            .map_err(anyhow::Error::msg)
+            .context("locating fragment function main0")?;
+
+        let descriptor = metal::RenderPipelineDescriptor::new();
+        descriptor.set_label("shader_effect_pass");
+        descriptor.set_vertex_function(Some(self.effect_pass_vertex_function.as_ref()));
+        descriptor.set_fragment_function(Some(fragment_function.as_ref()));
+        let color_attachment = descriptor
+            .color_attachments()
+            .object_at(0)
+            .context("missing color attachment")?;
+        color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        // Each pass replaces its target, as Ghostty's custom shader passes do.
+        color_attachment.set_blending_enabled(false);
+
+        self.device
+            .new_render_pipeline_state(&descriptor)
+            .map_err(anyhow::Error::msg)
+            .context("creating render pipeline")
+    }
+
+    /// Drops textures for effects not drawn this frame and bounds the compiled
+    /// source cache across configuration changes.
+    fn retire_effect_resources(&mut self) {
+        let frame = self.effect_frame;
+        self.effect_targets
+            .retain(|_, target| target.last_used_frame == frame);
+        // Keep ordinary pane switches from recompiling shaders. Only evict
+        // when enough distinct configurations have accumulated to fill the cache.
+        while self.effect_pipelines.len() > MAX_EFFECT_PIPELINE_CACHE_SIZE {
+            let oldest = self
+                .effect_pipelines
+                .iter()
+                .min_by_key(|(_, pipeline)| pipeline.last_used_frame)
+                .map(|(source, _)| source.clone());
+            if let Some(source) = oldest {
+                self.effect_pipelines.remove(&source);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Offscreen textures for one effect id. The captured scene is drawn into the
+/// first texture, then shader passes ping-pong between the two.
+struct EffectTarget {
+    size: Size<DevicePixels>,
+    textures: [metal::Texture; 2],
+    /// Allocated only once the effect's scene contains paths.
+    path_textures: PathIntermediateTextures,
+    last_used_frame: u64,
+}
+
+impl EffectTarget {
+    fn new(device: &metal::DeviceRef, size: Size<DevicePixels>) -> Self {
+        let texture_descriptor = metal::TextureDescriptor::new();
+        texture_descriptor.set_width(size.width.0 as u64);
+        texture_descriptor.set_height(size.height.0 as u64);
+        texture_descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        texture_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        Self {
+            size,
+            textures: [
+                device.new_texture(&texture_descriptor),
+                device.new_texture(&texture_descriptor),
+            ],
+            path_textures: PathIntermediateTextures::default(),
+            last_used_frame: 0,
+        }
+    }
+}
+
+struct EffectPipeline {
+    /// `None` when the source failed to compile.
+    state: Option<metal::RenderPipelineState>,
+    last_used_frame: u64,
+}
+
+/// The textures paths are rasterized into before being copied to their target.
+/// They must match the target's size, because the path sprite shader maps
+/// positions to texture coordinates through the viewport size.
+#[derive(Clone, Default)]
+pub(crate) struct PathIntermediateTextures {
+    texture: Option<metal::Texture>,
+    msaa_texture: Option<metal::Texture>,
+}
+
+fn new_path_intermediate_textures(
+    device: &metal::DeviceRef,
+    size: Size<DevicePixels>,
+    path_sample_count: u32,
+    is_apple_gpu: bool,
+) -> PathIntermediateTextures {
+    let texture_descriptor = metal::TextureDescriptor::new();
+    texture_descriptor.set_width(size.width.0 as u64);
+    texture_descriptor.set_height(size.height.0 as u64);
+    texture_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    texture_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+    texture_descriptor
+        .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+    let texture = Some(device.new_texture(&texture_descriptor));
+
+    let msaa_texture = if path_sample_count > 1 {
+        // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
+        // Rendering MSAA textures are done in a single pass, so we can use memory-less storage on Apple Silicon
+        let storage_mode = if is_apple_gpu {
+            metal::MTLStorageMode::Memoryless
+        } else {
+            metal::MTLStorageMode::Private
+        };
+
+        let msaa_descriptor = texture_descriptor;
+        msaa_descriptor.set_texture_type(metal::MTLTextureType::D2Multisample);
+        msaa_descriptor.set_storage_mode(storage_mode);
+        msaa_descriptor.set_sample_count(path_sample_count as _);
+        Some(device.new_texture(&msaa_descriptor))
+    } else {
+        None
+    };
+
+    PathIntermediateTextures {
+        texture,
+        msaa_texture,
+    }
+}
+
+/// Copies `scene` with every primitive moved by `-origin`, so that an effect's
+/// children land at the top-left of its texture.
+///
+/// Moving the geometry, rather than offsetting the viewport, is required:
+/// fragment shaders compare `[[position]]` against primitive bounds for rounded
+/// corners, borders, gradients and clipping.
+fn scene_in_effect_space(scene: &Scene, origin: Point<ScaledPixels>) -> Scene {
+    let offset_point = |position: Point<ScaledPixels>| Point {
+        x: position.x - origin.x,
+        y: position.y - origin.y,
+    };
+    let offset_bounds = |bounds: Bounds<ScaledPixels>| Bounds {
+        origin: offset_point(bounds.origin),
+        size: bounds.size,
+    };
+    let offset_mask = |mask: ContentMask<ScaledPixels>| ContentMask {
+        bounds: offset_bounds(mask.bounds),
+    };
+    // Sprites are positioned by their transformation, which is applied after
+    // their bounds, so only its translation moves.
+    let offset_transformation = |mut transformation: gpui::TransformationMatrix| {
+        transformation.translation[0] -= origin.x.0;
+        transformation.translation[1] -= origin.y.0;
+        transformation
+    };
+
+    let mut local = Scene::default();
+    local.shadows = scene
+        .shadows
+        .iter()
+        .map(|shadow| gpui::Shadow {
+            bounds: offset_bounds(shadow.bounds),
+            content_mask: offset_mask(shadow.content_mask),
+            element_bounds: offset_bounds(shadow.element_bounds),
+            ..*shadow
+        })
+        .collect();
+    local.quads = scene
+        .quads
+        .iter()
+        .map(|quad| gpui::Quad {
+            bounds: offset_bounds(quad.bounds),
+            content_mask: offset_mask(quad.content_mask),
+            ..*quad
+        })
+        .collect();
+    local.paths = scene
+        .paths
+        .iter()
+        .map(|path| {
+            let mut path = path.clone();
+            path.bounds = offset_bounds(path.bounds);
+            path.content_mask = offset_mask(path.content_mask);
+            for vertex in &mut path.vertices {
+                vertex.xy_position = offset_point(vertex.xy_position);
+                vertex.content_mask = offset_mask(vertex.content_mask);
+            }
+            path
+        })
+        .collect();
+    local.underlines = scene
+        .underlines
+        .iter()
+        .map(|underline| gpui::Underline {
+            bounds: offset_bounds(underline.bounds),
+            content_mask: offset_mask(underline.content_mask),
+            ..*underline
+        })
+        .collect();
+    local.monochrome_sprites = scene
+        .monochrome_sprites
+        .iter()
+        .map(|sprite| gpui::MonochromeSprite {
+            content_mask: offset_mask(sprite.content_mask),
+            transformation: offset_transformation(sprite.transformation),
+            ..*sprite
+        })
+        .collect();
+    local.subpixel_sprites = scene
+        .subpixel_sprites
+        .iter()
+        .map(|sprite| gpui::SubpixelSprite {
+            content_mask: offset_mask(sprite.content_mask),
+            transformation: offset_transformation(sprite.transformation),
+            ..*sprite
+        })
+        .collect();
+    local.polychrome_sprites = scene
+        .polychrome_sprites
+        .iter()
+        .map(|sprite| gpui::PolychromeSprite {
+            bounds: offset_bounds(sprite.bounds),
+            content_mask: offset_mask(sprite.content_mask),
+            ..*sprite
+        })
+        .collect();
+    local.surfaces = scene
+        .surfaces
+        .iter()
+        .map(|surface| PaintSurface {
+            bounds: offset_bounds(surface.bounds),
+            content_mask: offset_mask(surface.content_mask),
+            ..surface.clone()
+        })
+        .collect();
+    local
+}
+
+fn write_padded_bytes(
+    writer: &mut InstanceBufferWriter,
+    bytes: &[u8],
+    minimum_len: usize,
+) -> Result<InstanceBinding> {
+    let (binding, destination) = writer.allocate::<u8>(bytes.len().max(minimum_len))?;
+    for (slot, byte) in destination
+        .iter_mut()
+        .zip(bytes.iter().copied().chain(iter::repeat(0)))
+    {
+        slot.write(byte);
+    }
+    Ok(binding)
 }
 
 pub(crate) fn new_command_encoder_for_texture<'a>(
@@ -1422,6 +1976,8 @@ fn build_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    // CDXC:PlatformSupport 2026-09-19 WHY:
+    // Alpha composites "over" like the colour, as wgpu's `ALPHA_BLENDING` does on Linux. Adding it (`One`) summed the coverage of every primitive sharing an anti-aliased edge, and a div paints its background and its border as two quads with the same edge, so a transparent window's rounded corners came out nearly opaque with only the colour of a half-covered pixel, which macOS composited as a dark dotted rim on light backgrounds. Opaque windows ignore this channel.
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
@@ -1456,6 +2012,9 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    // Alpha must accumulate as `src.a + dst.a * (1 - src.a)` like the other pipelines. An
+    // additive `One` saturates to opaque wherever a path's antialiased edge lands on an already
+    // translucent pixel, and on a transparent window that punches a dark fringe into the blur.
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
@@ -1717,6 +2276,21 @@ pub struct PathSprite {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[repr(C)]
+enum EffectCompositeInputIndex {
+    Vertices = 0,
+    Bounds = 1,
+    ViewportSize = 2,
+    Texture = 3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct EffectCompositeBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
 }

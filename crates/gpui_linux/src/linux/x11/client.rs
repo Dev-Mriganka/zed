@@ -208,6 +208,7 @@ pub struct X11ClientState {
     pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
     pub(crate) windows: HashMap<xproto::Window, WindowRef>,
+    keyboard_focus_windows: HashMap<xproto::Window, xproto::Window>,
     pub(crate) mouse_focused_window: Option<xproto::Window>,
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
@@ -255,6 +256,9 @@ impl X11ClientStatePtr {
         };
         let mut state = client.0.borrow_mut();
 
+        state
+            .keyboard_focus_windows
+            .retain(|_, parent| *parent != x_window);
         if let Some(window_ref) = state.windows.remove(&x_window)
             && let Some(RefreshState::PeriodicRefresh {
                 event_loop_token, ..
@@ -529,6 +533,7 @@ impl X11Connection {
                 resource_database,
                 atoms,
                 windows: HashMap::default(),
+                keyboard_focus_windows: HashMap::default(),
                 mouse_focused_window: None,
                 keyboard_focused_window: None,
                 xkb: xkb_state,
@@ -876,6 +881,11 @@ impl X11Client {
 
     pub(crate) fn get_window(&self, win: xproto::Window) -> Option<X11WindowStatePtr> {
         let state = self.0.borrow();
+        let win = state
+            .keyboard_focus_windows
+            .get(&win)
+            .copied()
+            .unwrap_or(win);
         state
             .windows
             .get(&win)
@@ -1063,9 +1073,15 @@ impl X11Client {
             }
             Event::FocusIn(event) => {
                 let window = self.get_window(event.event)?;
+                // CDXC:FocusRouting 2026-09-18 WHY:
+                // Chromium can focus the parent en route to its own child; redirecting this notification to GPUI's keyboard child steals focus back from chat.
+                // Only explicit GPUI activation and chrome-input handoffs may request keyboard focus.
                 window.set_active(true);
+                if event.event == window.x_window && event.mode != xproto::NotifyMode::GRAB {
+                    window.focus_keyboard_window_after_activation(event.detail);
+                }
                 let mut state = self.0.borrow_mut();
-                state.keyboard_focused_window = Some(event.event);
+                state.keyboard_focused_window = Some(window.x_window);
                 if let Some(handler) = state.xim_handler.as_mut() {
                     handler.window = event.event;
                 }
@@ -1073,8 +1089,18 @@ impl X11Client {
                 self.enable_ime();
             }
             Event::FocusOut(event) => {
+                // CDXC:FocusRouting 2026-09-18 WHY:
+                // A child focus window keeps embedded clients from receiving GPUI's keys merely because the pointer is over them; moving focus into a child does not deactivate the toplevel or its input method.
+                // SEE-ALSO: window.rs owns the keyboard-focus child and selects its input events.
+                if event.detail == xproto::NotifyDetail::INFERIOR {
+                    return Some(());
+                }
                 let window = self.get_window(event.event)?;
-                window.set_active(false);
+                // The keyboard child losing focus to a sibling Chromium window is not app deactivation.
+                // A real departure also sends FocusOut to the toplevel; using the child's event here re-fires chrome-input focus listeners during internal handoffs.
+                if event.event == window.x_window {
+                    window.set_active(false);
+                }
                 let mut state = self.0.borrow_mut();
                 // Set last scroll values to `None` so that a large delta isn't created if scrolling is done outside the window (the valuator is global)
                 reset_all_pointer_device_scroll_positions(&mut state.pointer_device_states);
@@ -1168,10 +1194,16 @@ impl X11Client {
                         compose_state.feed(keysym);
                         match compose_state.status() {
                             xkbc::Status::Composed => {
-                                state.pre_edit_text.take();
+                                let had_pre_edit = state.pre_edit_text.take().is_some();
                                 keystroke.key_char = compose_state.utf8();
                                 if let Some(keysym) = compose_state.keysym() {
                                     keystroke.key = xkbc::keysym_get_name(keysym);
+                                }
+                                // CDXC:PlatformSupport 2026-10-18 SEE-ALSO: the Wayland compose path in wayland/client.rs closes the dead key's preedit before the composed KeyDown for the same reason (GitHub issue #256).
+                                if had_pre_edit {
+                                    drop(state);
+                                    window.handle_ime_delete();
+                                    state = self.0.borrow_mut();
                                 }
                             }
                             xkbc::Status::Composing => {
@@ -1726,10 +1758,28 @@ impl X11Client {
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
         let mut state = self.0.borrow_mut();
-        let parent_window = state
-            .keyboard_focused_window
-            .and_then(|focused_window| state.windows.get(&focused_window))
-            .map(|w| w.window.clone());
+        #[cfg(target_os = "linux")]
+        let explicit_parent = params.x11_parent;
+        #[cfg(not(target_os = "linux"))]
+        let explicit_parent: Option<AnyWindowHandle> = None;
+        // CDXC:PlatformSupport 2026-09-24 WHY:
+        // Deferred dialogs and hidden pickers must retain their owner even when a CEF child or a closing menu has keyboard focus. A stale explicit owner is an error, not permission to attach to another window.
+        let parent_window = if let Some(parent) = explicit_parent {
+            Some(
+                state
+                    .windows
+                    .values()
+                    .find(|window| window.handle().window_id() == parent.window_id())
+                    .context("X11 transient owner is no longer open")?
+                    .window
+                    .clone(),
+            )
+        } else {
+            state
+                .keyboard_focused_window
+                .and_then(|focused_window| state.windows.get(&focused_window))
+                .map(|w| w.window.clone())
+        };
         let x_window = state
             .xcb_connection
             .generate_id()
@@ -1785,6 +1835,9 @@ impl X11Client {
             is_mapped: false,
         };
 
+        state
+            .keyboard_focus_windows
+            .insert(window.0.state.borrow().keyboard_focus_window, x_window);
         state.windows.insert(x_window, window_ref);
         Ok(Box::new(window))
     }

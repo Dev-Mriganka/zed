@@ -3,7 +3,7 @@
 
 use crate::{
     AppContext as _, Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    Pixels, PlatformInput, Point, Render, ScrollDelta, ScrollHandle, ScrollEvent,
+    Pixels, PlatformInput, Point, Render, ScrollDelta, ScrollEvent, ScrollHandle,
     StatefulInteractiveElement as _, Styled as _, TestAppContext, TouchPhase, Window, WindowHandle,
     canvas, div, point, px, rgb, size,
 };
@@ -140,6 +140,7 @@ fn scroll_both(cx: &mut TestAppContext, update: bool, events: usize) -> usize {
                             delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
                             modifiers: Default::default(),
                             touch_phase: TouchPhase::Moved,
+                            source: crate::ScrollSource::Pointer,
                         }),
                         cx,
                     );

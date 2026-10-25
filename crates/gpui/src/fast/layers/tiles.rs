@@ -75,6 +75,10 @@ pub(crate) fn tile_hashes(
                     clip.translated(delta).hash(hasher);
                 }
             }
+            // A layer draws an effect's content plain (see
+            // `paint::draw_into_frame`): the primitives inside are hashed alone.
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
         }
     }
     hashers
@@ -115,6 +119,8 @@ pub(crate) fn part_tile_hashes(
             PaintOperation::StartLayer(_) => hasher.write_u8(1),
             PaintOperation::EndLayer => hasher.write_u8(2),
             PaintOperation::FastRoundedClip(clip) => clip.hash(&mut hasher),
+            #[cfg(target_os = "macos")]
+            PaintOperation::StartEffect { .. } | PaintOperation::EndEffect => {}
         }
     }
     let hash = hasher.finish();
@@ -296,6 +302,16 @@ fn hash_primitive(primitive: &Primitive, tile: &Bounds<ScaledPixels>, hasher: &m
             hasher.write_u8(7);
             hash_bounds(&surface.bounds, hasher);
             hash_mask(&surface.content_mask, tile, hasher);
+        }
+        // Never a paint operation (see `Scene::pop_effect`); hashed apart all
+        // the same, with what its shading depends on.
+        #[cfg(target_os = "macos")]
+        Primitive::Effect(effect) => {
+            hasher.write_u8(8);
+            hash_bounds(&effect.bounds, hasher);
+            hash_mask(&effect.content_mask, tile, hasher);
+            hasher.write_u64(effect.effect.id);
+            hasher.write(&effect.effect.uniforms);
         }
     }
 }

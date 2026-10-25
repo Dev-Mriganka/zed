@@ -27,6 +27,10 @@ pub mod metal_renderer {
 mod platform;
 mod window;
 mod window_appearance;
+mod window_live;
+mod window_video;
+mod window_wallpaper;
+mod window_wallpaper_system;
 
 use objc2::{
     Encode, Encoding, RefEncode,

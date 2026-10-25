@@ -64,6 +64,8 @@ mod apple_build {
             "PathSprite".into(),
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
+            "EffectCompositeInputIndex".into(),
+            "EffectCompositeBounds".into(),
             "TransformationMatrix".into(),
         ]);
         config.no_includes = true;

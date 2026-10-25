@@ -21,7 +21,7 @@ use crate::{
     TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
     TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point,
+    WindowInsets, WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, div, point,
     prelude::*, px, rems, size, transparent_black,
 };
 
@@ -65,12 +65,13 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod native_occlusions;
 mod prompts;
 
 pub use a11y::A11ySubtreeBuilder;
+pub use native_occlusions::{native_occlusion_row_gap, nudge_out_of_native_occlusions};
 
 use self::a11y::A11y;
-#[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
@@ -269,6 +270,10 @@ impl WindowInvalidator {
 
     pub fn take_views(&self) -> FxHashSet<EntityId> {
         mem::take(&mut self.inner.borrow_mut().dirty_views)
+    }
+
+    pub fn view_is_dirty(&self, view: EntityId) -> bool {
+        self.inner.borrow().dirty_views.contains(&view)
     }
 
     pub fn replace_views(&self, views: FxHashSet<EntityId>) {
@@ -971,6 +976,19 @@ impl TooltipId {
     }
 }
 
+/// Ghostex: receives the tooltip a frame would show, see [`Window::set_tooltip_presenter`].
+pub type TooltipPresenter = Rc<dyn Fn(Option<(AnyView, Bounds<Pixels>)>, &mut App)>;
+
+/// Ghostex: keeps a window's tooltips hidden while it lives, see [`Window::suppress_tooltips`].
+#[must_use = "tooltips are suppressed only while the guard is held"]
+pub struct TooltipSuppression(Rc<Cell<usize>>);
+
+impl Drop for TooltipSuppression {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 pub(crate) struct TooltipBounds {
     id: TooltipId,
     bounds: Bounds<Pixels>,
@@ -1061,6 +1079,8 @@ pub(crate) struct Frame {
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
+    /// Regions native child views cover this frame; see `Window::occlude_native_region`.
+    pub(crate) native_occlusions: Vec<Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
     #[cfg(any(test, feature = "test-support"))]
@@ -1077,6 +1097,7 @@ pub(crate) struct Frame {
 pub(crate) struct PrepaintStateIndex {
     pub(crate) hitboxes_index: usize,
     pub(crate) tooltips_index: usize,
+    pub(crate) native_occlusions_index: usize,
     pub(crate) deferred_draws_index: usize,
     pub(crate) dispatch_tree_index: usize,
     pub(crate) accessed_element_states_index: usize,
@@ -1121,6 +1142,7 @@ impl Frame {
             deferred_draws: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
+            native_occlusions: Vec::new(),
             cursor_styles: Vec::new(),
 
             #[cfg(any(test, feature = "test-support"))]
@@ -1148,6 +1170,7 @@ impl Frame {
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
+        self.native_occlusions.clear();
         self.hitboxes.clear();
         crate::fast::composition::SurfaceInput::clear(&mut self.fast_composition_input);
         self.window_control_hitboxes.clear();
@@ -1237,6 +1260,11 @@ enum InputModality {
     Touch,
 }
 
+thread_local! {
+    /// The window that last saw the pointer move or press (`Window::take_pointer_from_other_windows`).
+    static POINTER_WINDOW: std::cell::Cell<Option<WindowId>> = const { std::cell::Cell::new(None) };
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1283,14 +1311,26 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    tooltip_presenter: Option<TooltipPresenter>,
+    tooltip_presentation: Option<(AnyView, Bounds<Pixels>)>,
+    tooltip_suppressions: Rc<Cell<usize>>,
+    frosted_surface: bool,
+    frosted_regions: Vec<(Bounds<Pixels>, Pixels)>,
+    applied_frosted_regions: Option<Vec<(Bounds<Pixels>, Pixels)>>,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
+    /// The views notified for this draw, as opposed to those in `dirty_views` only because a view
+    /// inside them was notified; see [`Window::view_was_notified`].
+    notified_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     pub(crate) default_prevented: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) mouse_hit_test: HitTest,
+    /// Set when the pointer leaves the window and cleared by the next event that places it inside
+    /// again: while set nothing in the window is under the pointer.
+    pointer_left_window: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1613,6 +1653,8 @@ impl Window {
             focus,
             show,
             kind,
+            #[cfg(target_os = "linux")]
+            x11_parent,
             is_movable,
             app_owns_titlebar_drag,
             inactive_frame_interval,
@@ -1645,6 +1687,8 @@ impl Window {
                 bounds: window_bounds.get_bounds(),
                 titlebar,
                 kind,
+                #[cfg(target_os = "linux")]
+                x11_parent,
                 is_movable,
                 app_owns_titlebar_drag,
                 is_resizable,
@@ -1653,6 +1697,7 @@ impl Window {
                 show,
                 display_id,
                 window_min_size,
+                window_background,
                 app_id: app_id.clone(),
                 icon,
                 #[cfg(target_os = "macos")]
@@ -1701,7 +1746,7 @@ impl Window {
         let accessibility_force_disabled = cx.accessibility_force_disabled;
         let a11y_active_flag = Arc::new(AtomicBool::new(false));
 
-        #[cfg(not(target_family = "wasm"))]
+        // The web platform takes part too (gpui_web mirrors the tree into the page's DOM), so the setup is not gated on the target.
         if !accessibility_force_disabled {
             let mut initial_root_node = accesskit::Node::new(accesskit::Role::Window);
             if let Some(title) = &initial_window_title {
@@ -1724,19 +1769,19 @@ impl Window {
                     Box::new(move || {
                         log::info!("Accessibility activated");
                         active_flag.store(true, SeqCst);
-                        activation_sender.send_blocking(()).log_err();
+                        activation_sender.try_send(()).log_err();
                         Some(initial_tree.clone())
                     })
                 },
                 action: Box::new(move |request| {
-                    action_sender.send_blocking(request).log_err();
+                    action_sender.try_send(request).log_err();
                 }),
                 deactivation: {
                     let active_flag = a11y_active_flag.clone();
                     Box::new(move || {
                         log::info!("Accessibility deactivated");
                         active_flag.store(false, SeqCst);
-                        deactivation_sender.send_blocking(()).log_err();
+                        deactivation_sender.try_send(()).log_err();
                     })
                 },
             });
@@ -2082,13 +2127,16 @@ impl Window {
                     .unwrap_or(DispatchEventResult::default())
             })
         });
+        // CDXC:Titlebar 2026-09-27 WHY:
+        // Windows asks this on every `WM_NCHITTEST`, before the matching mouse message reaches GPUI, and moving from the client area onto an `HTCAPTION` region ends client mouse tracking with a `WM_MOUSELEAVE` that GPUI reports as `MouseExited`. Answering from `mouse_hit_test` therefore used a stale or emptied hit test, so the answer flipped between `HTCAPTION` and `HTCLIENT` as the pointer moved and pressing the titlebar often did not move the window. The platform passes the cursor position it is asking about instead.
         platform_window.on_hit_test_window_control({
             let mut cx = cx.to_async();
-            Box::new(move || {
+            Box::new(move |position| {
                 handle
                     .update(&mut cx, |_, window, _cx| {
+                        let hit_test = window.rendered_frame.hit_test(position);
                         for (area, hitbox) in &window.rendered_frame.window_control_hitboxes {
-                            if window.mouse_hit_test.ids.contains(&hitbox.id) {
+                            if hit_test.ids.contains(&hitbox.id) {
                                 return Some(*area);
                             }
                         }
@@ -2154,7 +2202,12 @@ impl Window {
             platform_window.set_app_id(&app_id);
         }
 
-        platform_window.map_window().unwrap();
+        // CDXC:PlatformSupport 2026-09-11 WHY:
+        // Mapping an X11 window makes it visible even when it was created with show=false, so hidden popup preloads must wait for explicit activation.
+        // SEE-ALSO: gpui_linux/src/linux/x11/window.rs (activate maps a hidden window).
+        if show {
+            platform_window.map_window()?;
+        }
 
         Ok(Window {
             handle,
@@ -2194,13 +2247,21 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
+            tooltip_presenter: None,
+            tooltip_presentation: None,
+            tooltip_suppressions: Rc::default(),
+            frosted_surface: false,
+            frosted_regions: Vec::new(),
+            applied_frosted_regions: None,
             dirty_views: FxHashSet::default(),
+            notified_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pointer_left_window: false,
             modifiers,
             capslock,
             scale_factor,
@@ -2743,6 +2804,30 @@ impl Window {
         AsyncWindowContext::new_context(cx.to_async(), self.handle)
     }
 
+    /// Whether `view` has been notified since it was last drawn, so the next draw renders it again
+    /// regardless of what else asks for a frame.
+    pub fn view_is_pending_render(&self, view: EntityId) -> bool {
+        self.invalidator.view_is_dirty(view) || self.dirty_views.contains(&view)
+    }
+
+    /// Whether `view` itself was notified for the frame being drawn.
+    ///
+    /// A view also renders when a view inside it was notified (notifying marks every ancestor
+    /// dirty), when its parent renders it uncached, and when the window refreshes. A view that
+    /// keeps a cached descendant can use this to draw the descendant again only when its own
+    /// state may have changed.
+    pub fn view_was_notified(&self, view: EntityId) -> bool {
+        self.notified_views.contains(&view)
+    }
+
+    /// Renders `view` in the frame being drawn even if it was drawn cached and nothing notified it.
+    ///
+    /// For a view that is rendering and knows a cached descendant must follow it this frame:
+    /// notifying the descendant from inside a draw only reaches the frame after this one.
+    pub fn render_view_this_frame(&mut self, view: EntityId) {
+        self.dirty_views.insert(view);
+    }
+
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
@@ -2936,6 +3021,13 @@ impl Window {
         self.platform_window.resize(size);
     }
 
+    /// Set an X11 child window frame in its explicit owner's content coordinates.
+    /// Returns false when this is not an X11 window with a live explicit owner.
+    #[cfg(target_os = "linux")]
+    pub fn set_x11_frame_in_parent(&mut self, frame: Bounds<Pixels>) -> bool {
+        self.platform_window.set_x11_frame_in_parent(frame)
+    }
+
     /// Returns whether or not the window is currently fullscreen
     pub fn is_fullscreen(&self) -> bool {
         self.platform_window.is_fullscreen()
@@ -3102,6 +3194,140 @@ impl Window {
     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.platform_window
             .set_background_appearance(background_appearance);
+    }
+
+    /// Rounds the corners of a blurred window background to match rounded content, so the blur
+    /// does not show as a square behind a card's corners.
+    pub fn set_background_corner_radius(&self, radius: Pixels) {
+        self.platform_window.set_background_corner_radius(radius);
+    }
+
+    /// Ghostex: tunes a blurred window background: how wide the blur is in points (0: none), and
+    /// whether the backdrop keeps its colour saturation, so the colours behind a menu or tooltip
+    /// show through instead of washing out to grey. See `PlatformWindow::set_background_blur_style`
+    /// for which backdrops each platform can blur.
+    pub fn set_background_blur_style(&self, radius: Pixels, keep_saturation: bool) {
+        self.platform_window
+            .set_background_blur_style(radius, keep_saturation);
+    }
+
+    /// Ghostex: which blur a blurred window background uses where the system draws the blur of the
+    /// windows behind it and has no radius to set (Windows). Other platforms ignore it.
+    pub fn set_background_behind_window_blur(&self, blur: crate::BehindWindowBlur) {
+        self.platform_window.set_background_behind_window_blur(blur);
+    }
+
+    /// Limits a blurred window background to these rounded rectangles, in window coordinates, so a
+    /// window holding several separate cards blurs only behind them. An empty list blurs the whole
+    /// window again.
+    pub fn set_background_blur_region(&self, region: Vec<(Bounds<Pixels>, Pixels)>) {
+        self.platform_window.set_background_blur_region(region);
+    }
+
+    /// Makes a blurred window background show the blurred desktop picture rather than every window
+    /// behind this one. Platforms that cannot read the desktop picture keep the live blur.
+    pub fn set_background_wallpaper(&self, wallpaper: bool) {
+        self.platform_window.set_background_wallpaper(wallpaper);
+    }
+
+    /// Makes a wallpaper background show this picture, blurred, instead of the desktop picture. A
+    /// picture that cannot be read leaves the live blur.
+    pub fn set_background_wallpaper_image(&self, image: Option<std::path::PathBuf>) {
+        self.platform_window.set_background_wallpaper_image(image);
+    }
+
+    /// Whether a wallpaper background's picture stays still against the screen while the window
+    /// moves, or (the default) is attached to the window and covers it, which needs no update
+    /// while the window is dragged.
+    pub fn set_background_wallpaper_follows_screen(&self, follows_screen: bool) {
+        self.platform_window
+            .set_background_wallpaper_follows_screen(follows_screen);
+    }
+
+    /// Makes a picture attached to the window cover this rectangle, in window coordinates, instead
+    /// of the window itself, so a window laid over part of another shows the same part of the same
+    /// picture. `None` covers the window.
+    pub fn set_background_wallpaper_cover(&self, cover: Option<Bounds<Pixels>>) {
+        self.platform_window.set_background_wallpaper_cover(cover);
+    }
+
+    /// Makes a wallpaper background play this video, muted, looping and blurred, placed like its
+    /// picture. It pauses whenever nobody can see it (the app in the background, the window
+    /// hidden, the screen asleep), in Low Power Mode, under Reduce Motion (which shows its first
+    /// frame), and on battery when `only_on_power` is set. A video that cannot be read leaves the
+    /// live blur; `None` goes back to the picture.
+    pub fn set_background_video(&self, video: Option<std::path::PathBuf>, only_on_power: bool) {
+        self.platform_window
+            .set_background_video(video, only_on_power);
+    }
+
+    /// Ghostex: makes a wallpaper background draw an animated live style instead of its picture or
+    /// video. It stops moving under the same conditions as the video (nobody can see it, Low Power
+    /// Mode, battery when `only_on_power` is set) and shows a still frame under Reduce Motion. A
+    /// style the platform does not draw leaves the live blur; `None` goes back to the picture.
+    pub fn set_background_live(&self, live: Option<crate::LiveBackground>) {
+        self.platform_window.set_background_live(live);
+    }
+
+    /// Ghostex: marks this window as a frosted surface. Its blurred background is then limited to
+    /// the regions its elements report each frame through [`Window::report_frosted_region`].
+    ///
+    /// A frosted window draws every frame from scratch (no view retention): the regions are
+    /// reported while painting, so a view drawn again from the last frame would not report its
+    /// own. Frosted windows are small menus and tooltip bubbles, so this costs nothing.
+    pub fn set_frosted_surface(&mut self, frosted: bool) {
+        self.frosted_surface = frosted;
+        self.applied_frosted_regions = None;
+        if frosted {
+            self.retained_state.view_retention = false;
+        }
+        self.refresh();
+    }
+
+    /// Whether this window is a frosted surface (see [`Window::set_frosted_surface`]).
+    pub fn frosted_surface(&self) -> bool {
+        self.frosted_surface
+    }
+
+    /// Adds a rounded rect, in this window's coordinates, to this frame's frosted region.
+    pub fn report_frosted_region(&mut self, bounds: Bounds<Pixels>, corner_radius: Pixels) {
+        if self.frosted_surface {
+            self.frosted_regions.push((bounds, corner_radius));
+        }
+    }
+
+    /// Ghostex: hands this window's tooltips to `presenter` instead of painting them. Every drawn
+    /// frame calls it once with the tooltip that frame would show (its view and its bounds in this
+    /// window), or `None`, so the host can draw it in a window of its own.
+    pub fn set_tooltip_presenter(&mut self, presenter: Option<TooltipPresenter>) {
+        self.tooltip_presenter = presenter;
+        self.refresh();
+    }
+
+    /// Whether this window's tooltips go to a presenter (see [`Window::set_tooltip_presenter`]).
+    pub fn tooltip_presenter_active(&self) -> bool {
+        self.tooltip_presenter.is_some()
+    }
+
+    /// Ghostex: a tooltip drawn outside the stock tooltip path (a managed overlay) reports itself
+    /// here while a presenter is set, instead of painting.
+    pub fn present_tooltip(&mut self, view: AnyView, bounds: Bounds<Pixels>) {
+        self.tooltip_presentation = Some((view, bounds));
+    }
+
+    /// Ghostex: hides this window's tooltips, and keeps new ones from showing, until the returned
+    /// guard drops. A menu holds one on the window it was opened from, so a tooltip whose trigger
+    /// was hovered (or pressed) as the menu opened never shows over it.
+    pub fn suppress_tooltips(&mut self) -> TooltipSuppression {
+        self.tooltip_suppressions
+            .set(self.tooltip_suppressions.get() + 1);
+        self.refresh();
+        TooltipSuppression(self.tooltip_suppressions.clone())
+    }
+
+    /// Whether a [`TooltipSuppression`] guard is held for this window.
+    pub fn tooltips_suppressed(&self) -> bool {
+        self.tooltip_suppressions.get() > 0
     }
 
     /// Mark the window as dirty at the platform level.
@@ -3458,6 +3684,40 @@ impl Window {
         self.last_input_modality == InputModality::Touch
     }
 
+    /// Shows `build`'s view for `duration` as the tooltip of the tooltip trigger under the pointer,
+    /// in place of that trigger's own tooltip, then gives the trigger its tooltip back. Returns
+    /// false, showing nothing, when no trigger painted in the last frame is under the pointer.
+    /// For feedback on the control just clicked ("Copied!") that should read as its tooltip
+    /// changing rather than as a second label beside it.
+    pub fn flash_hovered_tooltip(
+        &mut self,
+        duration: Duration,
+        build: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
+        cx: &mut App,
+    ) -> bool {
+        let hit_test = self.pointer_hit_test(&self.rendered_frame);
+        if hit_test != self.mouse_hit_test {
+            self.mouse_hit_test = hit_test;
+            self.reset_cursor_style(cx);
+        }
+        let request = crate::TooltipFlashRequest {
+            build: Rc::new(build),
+            duration,
+            claimed: Cell::new(false),
+        };
+        let mut mouse_listeners = mem::take(&mut self.rendered_frame.mouse_listeners);
+        for listener in mouse_listeners.iter_mut().rev() {
+            if let Some(listener) = listener.as_mut() {
+                listener(&request, DispatchPhase::Bubble, self, cx);
+            }
+            if request.claimed.get() {
+                break;
+            }
+        }
+        self.rendered_frame.mouse_listeners = mouse_listeners;
+        request.claimed.get()
+    }
+
     /// The current state of the keyboard's capslock
     pub fn capslock(&self) -> Capslock {
         crate::fast::dependencies::read_keys(self);
@@ -3647,6 +3907,7 @@ impl Window {
     fn invalidate_entities(&mut self) {
         let mut views = self.invalidator.take_views();
         crate::fast::retained::RetainedState::note_notified(&mut self.retained_state, &views);
+        self.notified_views.clone_from(&views);
         for entity in views.drain() {
             self.mark_view_dirty(entity);
         }
@@ -3723,6 +3984,8 @@ impl Window {
         crate::fast::retained::begin_frame(self, cx);
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
+        self.tooltip_presentation = None;
+        self.frosted_regions.clear();
 
         self.a11y.sync_active_flag();
         if self.a11y.is_active() {
@@ -3790,13 +4053,17 @@ impl Window {
             element.prepaint_as_root(offset, AvailableSpace::min_size(), self, cx);
             active_drag_element = Some(element);
             cx.active_drag = Some(active_drag);
-        } else {
+        } else if !self.tooltips_suppressed() {
             tooltip_element = self.prepaint_tooltip(cx);
+        }
+        if let Some(presenter) = self.tooltip_presenter.clone() {
+            let presentation = self.tooltip_presentation.take();
+            presenter(presentation.filter(|_| !self.tooltips_suppressed()), cx);
         }
 
         crate::fast::stats::FramePhaseTimes::end_prepaint(&mut self.fast_layout.phase_times);
         crate::fast::composition::finish_input(self);
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.pointer_hit_test(&self.next_frame);
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
@@ -3817,6 +4084,14 @@ impl Window {
             drag_element.paint(self, cx);
         } else if let Some(mut tooltip_element) = tooltip_element {
             tooltip_element.paint(self, cx);
+        }
+
+        if self.frosted_surface
+            && self.applied_frosted_regions.as_ref() != Some(&self.frosted_regions)
+        {
+            self.applied_frosted_regions = Some(self.frosted_regions.clone());
+            self.platform_window
+                .set_background_blur_region(self.frosted_regions.clone());
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3873,24 +4148,56 @@ impl Window {
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
             let mouse_position = tooltip_request.tooltip.mouse_position;
-            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
-
-            let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
             let window_bounds = Bounds {
                 origin: Point::default(),
                 size: self.viewport_size(),
             };
 
-            if tooltip_bounds.right() > window_bounds.right() {
+            // CDXC:Tooltips 2026-09-24 DECISION:
+            // User: a tooltip that leaves its pane "can end up cut off under the CEF pane if it's next to the one we're in"; tooltips must dodge the frames native views cover (they draw over everything GPUI paints) rather than stay inside their own pane, and one wider than the room next to its trigger wraps to that room instead of being shortened. The region's edge on the pointer's row is treated like a window edge: the tooltip flips to the pointer's other side first, then shifts, and the element is laid out inside a box no wider than the room so its text wraps.
+            //
+            // CDXC:Tooltips 2026-10-25 WHY:
+            // A tooltip handed to a presenter draws in a window of its own above this one (Ghostex's frosted tooltip host), so native views cannot cover it and it has the whole window to fit in. Fitting it into the gap between native views instead (the Files panel beside a terminal, say) left a card wider than that gap pinned to the gap's left edge, running past the window's right edge.
+            let occlusions = if self.tooltip_presenter.is_some() {
+                Vec::new()
+            } else {
+                self.next_frame.native_occlusions.clone()
+            };
+            let mut left_limit = Pixels::ZERO;
+            // A presented tooltip is kept inside the app window by its host, which can reach past a
+            // narrow child window's edges, so it is not flipped or shifted against this one's.
+            let mut right_limit = if self.tooltip_presenter.is_some() {
+                Pixels::MAX
+            } else {
+                window_bounds.right()
+            };
+            if !occlusions.is_empty() {
+                let gap = native_occlusion_row_gap(
+                    Bounds::new(mouse_position, size(px(1.), px(1.))),
+                    &occlusions,
+                    window_bounds.size,
+                );
+                left_limit = gap.start;
+                right_limit = gap.end;
+                let room = right_limit - left_limit - px(2.);
+                if room > Pixels::ZERO {
+                    element = div().flex().max_w(room).child(element).into_any_element();
+                }
+            }
+            let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
+
+            let mut tooltip_bounds =
+                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
+
+            if tooltip_bounds.right() > right_limit {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
+                if new_x >= left_limit {
                     tooltip_bounds.origin.x = new_x;
                 } else {
-                    tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
-                    );
+                    // Shift left until the right edge meets the limit (the stock formula,
+                    // `origin - right - limit`, always landed on the left limit).
+                    tooltip_bounds.origin.x =
+                        cmp::max(left_limit, right_limit - tooltip_bounds.size.width - px(1.));
                 }
             }
 
@@ -3901,9 +4208,14 @@ impl Window {
                 } else {
                     tooltip_bounds.origin.y = cmp::max(
                         Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+                        window_bounds.bottom() - tooltip_bounds.size.height - px(1.),
                     );
                 }
+            }
+
+            if !occlusions.is_empty() {
+                tooltip_bounds =
+                    nudge_out_of_native_occlusions(tooltip_bounds, &occlusions, window_bounds);
             }
 
             // It's possible for an element to have an active tooltip while not being painted (e.g.
@@ -3913,6 +4225,16 @@ impl Window {
                 (tooltip_request.tooltip.check_visible_and_update)(tooltip_bounds, self, cx);
             if !is_visible {
                 continue;
+            }
+
+            if self.tooltip_presenter.is_some() {
+                self.tooltip_bounds = Some(TooltipBounds {
+                    id: tooltip_request.id,
+                    bounds: tooltip_bounds,
+                });
+                self.tooltip_presentation =
+                    Some((tooltip_request.tooltip.view.clone(), tooltip_bounds));
+                return None;
             }
 
             self.with_absolute_element_offset(tooltip_bounds.origin, |window| {
@@ -4054,6 +4376,7 @@ impl Window {
         PrepaintStateIndex {
             hitboxes_index: self.next_frame.hitboxes.len(),
             tooltips_index: self.next_frame.tooltip_requests.len(),
+            native_occlusions_index: self.next_frame.native_occlusions.len(),
             deferred_draws_index: self.next_frame.deferred_draws.len(),
             dispatch_tree_index: self.next_frame.dispatch_tree.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
@@ -4074,6 +4397,12 @@ impl Window {
                 [range.start.tooltips_index..range.end.tooltips_index]
                 .iter_mut()
                 .map(|request| request.take()),
+        );
+        self.next_frame.native_occlusions.extend(
+            self.rendered_frame.native_occlusions
+                [range.start.native_occlusions_index..range.end.native_occlusions_index]
+                .iter()
+                .cloned(),
         );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
@@ -4911,7 +5240,11 @@ impl Window {
 
         let (integer_origin, subpixel_variant) = crate::fast::glyphs::quantize_origin(glyph_origin);
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let dilation = if self.text_style().font_smoothing {
+            self.text_system().glyph_dilation_for_color(color)
+        } else {
+            0
+        };
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -5236,6 +5569,65 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Paints everything `f` draws into an offscreen texture the size of
+    /// `bounds`, runs `effect`'s shaders over it, and composites the result at
+    /// the current z-index, clipped to the current content mask.
+    ///
+    /// Only pixels are redirected: hitboxes, input handlers, layout and element
+    /// state inside `f` work as usual, and the captured primitives keep their
+    /// normal relative order. Anything `f` paints outside `bounds` is cut off.
+    /// Effects don't nest; one painted inside another becomes plain content of
+    /// the outer one. An effect without shaders paints `f` directly.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_effect<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        effect: crate::ShaderEffect,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        if effect.shaders.is_empty() || !self.supports_shader_effects() {
+            return f(self);
+        }
+
+        let bounds = self.snap_bounds(bounds);
+        if bounds.size.width.0 <= 0.0
+            || bounds.size.height.0 <= 0.0
+            || bounds.size.width.0 > crate::MAX_SHADER_EFFECT_TEXTURE_SIZE as f32
+            || bounds.size.height.0 > crate::MAX_SHADER_EFFECT_TEXTURE_SIZE as f32
+        {
+            return f(self);
+        }
+        let content_mask = self.snapped_content_mask();
+        self.next_frame
+            .scene
+            .push_effect(effect, bounds, content_mask);
+        let result = f(self);
+        self.next_frame.scene.pop_effect();
+        result
+    }
+
+    /// The size, in device pixels, of the texture [`Window::paint_effect`]
+    /// renders `bounds` into. This is the canvas the shaders see, so use it for
+    /// resolution uniforms.
+    #[cfg(target_os = "macos")]
+    pub fn shader_effect_size(&self, bounds: Bounds<Pixels>) -> Size<DevicePixels> {
+        let bounds = self.snap_bounds(bounds);
+        size(
+            DevicePixels(bounds.size.width.0 as i32),
+            DevicePixels(bounds.size.height.0 as i32),
+        )
+    }
+
+    /// Whether this window's renderer supports the macOS shader-effect API.
+    #[cfg(target_os = "macos")]
+    pub fn supports_shader_effects(&self) -> bool {
+        self.platform_window.supports_shader_effects()
     }
 
     /// Removes an image from the sprite atlas.
@@ -5701,6 +6093,24 @@ impl Window {
             self.refresh();
         }
 
+        if matches!(
+            event,
+            PlatformInput::MouseMove(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::MouseUp(_)
+                | PlatformInput::Scroll(_)
+                | PlatformInput::Pinch(_)
+                | PlatformInput::FileDrop(_)
+        ) {
+            self.pointer_left_window = false;
+            if matches!(
+                event,
+                PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_)
+            ) {
+                self.take_pointer_from_other_windows(cx);
+            }
+        }
+
         let ambient = crate::fast::dependencies::AmbientInput::of(self);
         // Handlers may set this to false by calling `stop_propagation`.
         cx.propagate_event = true;
@@ -5728,8 +6138,14 @@ impl Window {
             PlatformInput::MousePressure(mouse_pressure) => {
                 PlatformInput::MousePressure(mouse_pressure)
             }
+            // CDXC:PlatformSupport 2026-09-26 WHY:
+            // Moving from a GPUI element into a native child view (macOS NSView, Windows child HWND) ends mouse tracking without another mouse move, so the hit test stayed on the element last under the pointer and its `.hover()` style never cleared.
+            // Following the exit position instead (the 2026-09-19 fix) re-hovered whatever GPUI element lies under the child view or at the window's edge on the next frame, and broke upstream's rule that a MouseExited leaves hover listeners unhovered; nothing is under the pointer until it comes back.
             PlatformInput::MouseExited(mouse_exited) => {
+                self.mouse_position = mouse_exited.position;
                 self.modifiers = mouse_exited.modifiers;
+                self.pointer_left_window = true;
+                self.refresh();
                 PlatformInput::MouseExited(mouse_exited)
             }
             PlatformInput::ModifiersChanged(modifiers_changed) => {
@@ -6035,8 +6451,56 @@ impl Window {
         });
     }
 
+    /// The pointer moved or pressed in this window: every other window that still believes it
+    /// has the pointer is told it left, as macOS would if the pointer had crossed its edge.
+    ///
+    /// CDXC:Tooltips 2026-10-25 DECISION:
+    /// User: the Files view's "Show files" tooltip "keeps being shown even after the files bar appears and goes over that button and im not hovering that button anymore and it's fighting with tooltips of other files". A window that one of the app's own windows opens over (a floating panel, a menu, a popover) never hears the pointer leave, because the pointer never crosses its edge, so its hovered element and that element's tooltip stayed up. Pointer input reaching another window now ends hover in the window that had it, so a tooltip closes when its window loses the pointer or its element is covered, and only the window under the pointer can show one.
+    fn take_pointer_from_other_windows(&mut self, cx: &mut App) {
+        let this = self.handle;
+        let changed = POINTER_WINDOW.with(|owner| owner.replace(Some(this.window_id())))
+            != Some(this.window_id());
+        if !changed {
+            return;
+        }
+        cx.defer(move |cx| {
+            for other in cx.windows() {
+                if other == this {
+                    continue;
+                }
+                other
+                    .update(cx, |_, window, cx| window.lose_pointer_to_other_window(cx))
+                    .ok();
+            }
+        });
+    }
+
+    /// Ends hover here the way a real `MouseExited` does, unless the pointer already left.
+    fn lose_pointer_to_other_window(&mut self, cx: &mut App) {
+        if self.pointer_left_window {
+            return;
+        }
+        self.dispatch_event(
+            PlatformInput::MouseExited(crate::MouseExitEvent {
+                position: self.mouse_position,
+                pressed_button: None,
+                modifiers: self.modifiers,
+            }),
+            cx,
+        );
+    }
+
+    /// What is under the pointer in `frame`: nothing while the pointer is outside the window.
+    fn pointer_hit_test(&self, frame: &Frame) -> HitTest {
+        if self.pointer_left_window {
+            HitTest::default()
+        } else {
+            frame.hit_test(self.mouse_position)
+        }
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.pointer_hit_test(&self.rendered_frame);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -7139,7 +7603,6 @@ impl Window {
             .push((action, Box::new(listener)));
     }
 
-    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
         // Take listeners out temporarily so the closures can borrow Window
         // mutably, then restore them afterward.
@@ -9872,6 +10335,7 @@ mod tests {
                         position: point(px(x), px(0.)),
                         predicted_position: None,
                         force: None,
+                        timestamp: None,
                     }
                     .to_platform_input(),
                     cx,

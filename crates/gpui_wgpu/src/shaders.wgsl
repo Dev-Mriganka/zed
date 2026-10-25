@@ -1227,7 +1227,19 @@ struct MonoSpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) @interpolate(flat) tile_texel_bounds: vec4<f32>,
     @location(3) clip_distances: vec4<f32>,
+}
+
+// Atlas tiles are packed with no gutter, so a bilinear sample within half a texel of a tile's
+// edge blends in the neighbouring tile. Unrotated sprites never sample that close, but a rotated
+// or scaled one does along its whole outline, which showed as a flickering square around spinning
+// icons. Clamping to the centres of the tile's edge texels keeps every sample inside the tile.
+fn tile_texel_bounds(tile: AtlasTile) -> vec4<f32> {
+    let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+    let origin = vec2<f32>(tile.bounds.origin);
+    let size = vec2<f32>(tile.bounds.size);
+    return vec4<f32>((origin + 0.5) / atlas_size, (origin + size - 0.5) / atlas_size);
 }
 
 @vertex
@@ -1240,13 +1252,15 @@ fn vs_mono_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
     out.color = hsla_to_rgba(sprite.color);
+    out.tile_texel_bounds = tile_texel_bounds(sprite.tile);
     out.clip_distances = distance_from_clip_rect_transformed(unit_vertex, sprite.bounds, sprite.content_mask, sprite.transformation);
     return out;
 }
 
 @fragment
 fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
+    let tile_position = clamp(input.tile_position, input.tile_texel_bounds.xy, input.tile_texel_bounds.zw);
+    let sample = textureSample(t_sprite, s_sprite, tile_position).r;
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
 
     // Alpha clip after using the derivatives.

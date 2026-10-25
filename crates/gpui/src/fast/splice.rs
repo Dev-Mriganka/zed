@@ -775,6 +775,15 @@ impl Window {
                 .iter_mut()
                 .map(|request| request.take()),
         );
+        // Ghostex: the regions native child views cover (`Window::occlude_native_region`), which
+        // `Window::reuse_prepaint` carries too; without them a spliced view's tooltips could
+        // draw over a browser pane.
+        self.next_frame.native_occlusions.extend(
+            self.rendered_frame.native_occlusions
+                [range.start.native_occlusions_index..range.end.native_occlusions_index]
+                .iter()
+                .cloned(),
+        );
         self.next_frame.accessed_element_states.extend(
             self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
                 ..range.end.accessed_element_states_index]
