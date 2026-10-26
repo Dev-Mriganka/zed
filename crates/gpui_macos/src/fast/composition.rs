@@ -800,7 +800,7 @@ unsafe fn create_gpui_surface(
     let mut renderer = renderer::new_overlay_renderer(
         state.fast_composition.renderer_context.clone(),
         &state.renderer,
-    );
+    )?;
     let scale_factor = state.scale_factor();
     renderer.update_drawable_size(state.content_size().to_device_pixels(scale_factor));
     set_contents_scale(&renderer, scale_factor);

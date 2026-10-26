@@ -9,19 +9,30 @@
 use gpui::LiveBackground;
 use objc2::{
     class, msg_send,
-    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel},
+    rc::Retained,
+    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, ProtocolObject, Sel},
     sel,
 };
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSWindowOrderingMode};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLLoadAction, MTLOrigin, MTLPixelFormat,
+    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLSize, MTLStorageMode, MTLStoreAction,
+    MTLTexture, MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
+};
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use std::{
     cell::RefCell,
     collections::HashMap,
-    ffi::c_void,
-    ptr,
+    ptr::{self, NonNull},
     sync::OnceLock,
     time::{Duration, Instant},
 };
+
+type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
+type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
 use crate::window_video;
 
@@ -65,25 +76,25 @@ struct LiveUniforms {
 
 struct LiveView {
     view: *mut AnyObject,
-    layer: metal::MetalLayer,
+    layer: Retained<CAMetalLayer>,
     live: LiveBackground,
     /// The rectangle, in the view's top-left coordinates, the style is laid out over; `None` is the
     /// view itself.
     cover: Option<NSRect>,
     wants_motion: bool,
     /// The picture last put on screen; it is also what a change fades out from.
-    display: Option<metal::Texture>,
+    display: Option<Texture>,
     /// The new picture on its own while a fade composites it over `fading_from`.
-    style_frame: Option<metal::Texture>,
-    fading_from: Option<metal::Texture>,
+    style_frame: Option<Texture>,
+    fading_from: Option<Texture>,
     fade_started: Option<Instant>,
 }
 
 struct LiveRenderer {
-    device: metal::Device,
-    queue: metal::CommandQueue,
-    library: metal::Library,
-    pipelines: HashMap<&'static str, metal::RenderPipelineState>,
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    pipelines: HashMap<&'static str, Pipeline>,
 }
 
 struct LiveClock {
@@ -117,15 +128,15 @@ pub(crate) unsafe fn create_view(
     unsafe {
         let style = style_id(&live.style)?;
         with_renderer(|renderer| pipeline(renderer, style).map(|_| ()))??;
-        let layer = metal::MetalLayer::new();
-        with_renderer(|renderer| layer.set_device(&renderer.device))?;
-        layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-        layer.set_opaque(true);
+        let layer = CAMetalLayer::new();
+        with_renderer(|renderer| layer.setDevice(Some(&renderer.device)))?;
+        layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        layer.setOpaque(true);
         // Frames are drawn off screen and copied in, so the drawable is a copy target.
-        layer.set_framebuffer_only(false);
-        layer.set_maximum_drawable_count(2);
-        let layer_id = layer.as_ref() as *const metal::MetalLayerRef as *mut AnyObject;
-        let _: () = msg_send![layer_id, setNeedsDisplayOnBoundsChange: Bool::NO];
+        layer.setFramebufferOnly(false);
+        layer.setMaximumDrawableCount(2);
+        layer.setNeedsDisplayOnBoundsChange(false);
+        let layer_id = Retained::as_ptr(&layer).cast_mut().cast::<AnyObject>();
 
         let class = view_class();
         let view: *mut AnyObject = msg_send![class, alloc];
@@ -268,12 +279,20 @@ fn style_id(style: &str) -> Option<&'static str> {
 fn with_renderer<R>(action: impl FnOnce(&mut LiveRenderer) -> R) -> Option<R> {
     RENDERER.with_borrow_mut(|slot| {
         if slot.is_none() {
-            let device = metal::Device::system_default()?;
+            let device = MTLCreateSystemDefaultDevice()?;
             let library = device
-                .new_library_with_source(SHADER_SOURCE, &metal::CompileOptions::new())
-                .map_err(|error| log::error!("live backdrop shaders do not compile: {error}"))
+                .newLibraryWithSource_options_error(
+                    &NSString::from_str(SHADER_SOURCE),
+                    Some(&MTLCompileOptions::new()),
+                )
+                .map_err(|error| {
+                    log::error!(
+                        "live backdrop shaders do not compile: {}",
+                        error.localizedDescription()
+                    )
+                })
                 .ok()?;
-            let queue = device.new_command_queue();
+            let queue = device.newCommandQueue()?;
             *slot = Some(LiveRenderer {
                 device,
                 queue,
@@ -286,44 +305,59 @@ fn with_renderer<R>(action: impl FnOnce(&mut LiveRenderer) -> R) -> Option<R> {
 }
 
 /// The pipeline drawing `name`: a style id, or "composite" for the fade.
-fn pipeline(renderer: &mut LiveRenderer, name: &'static str) -> Option<metal::RenderPipelineState> {
+fn pipeline(renderer: &mut LiveRenderer, name: &'static str) -> Option<Pipeline> {
     if let Some(pipeline) = renderer.pipelines.get(name) {
         return Some(pipeline.clone());
     }
-    let vertex = renderer.library.get_function("live_vertex", None).ok()?;
-    let fragment = renderer
+    let vertex = renderer
         .library
-        .get_function(&format!("live_{name}"), None)
-        .map_err(|error| log::error!("live backdrop function {name} is missing: {error}"))
-        .ok()?;
-    let descriptor = metal::RenderPipelineDescriptor::new();
-    descriptor.set_vertex_function(Some(&vertex));
-    descriptor.set_fragment_function(Some(&fragment));
-    descriptor
-        .color_attachments()
-        .object_at(0)?
-        .set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        .newFunctionWithName(&NSString::from_str("live_vertex"))?;
+    let Some(fragment) = renderer
+        .library
+        .newFunctionWithName(&NSString::from_str(&format!("live_{name}")))
+    else {
+        log::error!("live backdrop function {name} is missing");
+        return None;
+    };
+    let descriptor = MTLRenderPipelineDescriptor::new();
+    descriptor.setVertexFunction(Some(&vertex));
+    descriptor.setFragmentFunction(Some(&fragment));
+    // SAFETY: Index zero is within the pipeline's color attachment array.
+    unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) }
+        .setPixelFormat(MTLPixelFormat::BGRA8Unorm);
     let pipeline = renderer
         .device
-        .new_render_pipeline_state(&descriptor)
-        .map_err(|error| log::error!("live backdrop {name} has no pipeline: {error}"))
+        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+        .map_err(|error| {
+            log::error!(
+                "live backdrop {name} has no pipeline: {}",
+                error.localizedDescription()
+            )
+        })
         .ok()?;
     renderer.pipelines.insert(name, pipeline.clone());
     Some(pipeline)
 }
 
-fn offscreen_texture(device: &metal::DeviceRef, width: u64, height: u64) -> metal::Texture {
-    let descriptor = metal::TextureDescriptor::new();
-    descriptor.set_texture_type(metal::MTLTextureType::D2);
-    descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
-    descriptor.set_width(width);
-    descriptor.set_height(height);
-    descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-    descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-    device.new_texture(&descriptor)
+fn offscreen_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: usize,
+    height: usize,
+) -> Option<Texture> {
+    let descriptor = MTLTextureDescriptor::new();
+    descriptor.setTextureType(MTLTextureType::Type2D);
+    descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+    // SAFETY: Both sizes are at least 16 and this descriptor creates a 2D texture.
+    unsafe {
+        descriptor.setWidth(width);
+        descriptor.setHeight(height);
+    }
+    descriptor.setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    descriptor.setStorageMode(MTLStorageMode::Private);
+    device.newTextureWithDescriptor(&descriptor)
 }
 
-fn texture_matches(texture: &Option<metal::Texture>, width: u64, height: u64) -> bool {
+fn texture_matches(texture: &Option<Texture>, width: usize, height: usize) -> bool {
     texture
         .as_ref()
         .is_some_and(|texture| texture.width() == width && texture.height() == height)
@@ -350,17 +384,18 @@ fn fade_amount(started: Option<Instant>) -> Option<f32> {
     Some(t * t * (3.0 - 2.0 * t))
 }
 
-fn begin_pass<'a>(
-    command_buffer: &'a metal::CommandBufferRef,
-    target: &metal::TextureRef,
-) -> Option<&'a metal::RenderCommandEncoderRef> {
-    let pass = metal::RenderPassDescriptor::new();
-    let attachment = pass.color_attachments().object_at(0)?;
-    attachment.set_texture(Some(target));
+fn begin_pass(
+    command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+    target: &ProtocolObject<dyn MTLTexture>,
+) -> Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
+    let pass = MTLRenderPassDescriptor::new();
+    // SAFETY: Index zero is within the render pass's color attachment array.
+    let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+    attachment.setTexture(Some(target));
     // Every pass covers its whole target with one triangle.
-    attachment.set_load_action(metal::MTLLoadAction::DontCare);
-    attachment.set_store_action(metal::MTLStoreAction::Store);
-    Some(command_buffer.new_render_command_encoder(pass))
+    attachment.setLoadAction(MTLLoadAction::DontCare);
+    attachment.setStoreAction(MTLStoreAction::Store);
+    command_buffer.renderCommandEncoderWithDescriptor(&pass)
 }
 
 unsafe fn draw_entry(entry: &mut LiveView, phase: f64) {
@@ -377,10 +412,9 @@ unsafe fn draw_entry(entry: &mut LiveView, phase: f64) {
             .min(LIVE_MAX_DRAWABLE.1 / bounds.size.height);
         let width = (bounds.size.width * factor).round().max(16.0);
         let height = (bounds.size.height * factor).round().max(16.0);
-        let current = entry.layer.drawable_size();
+        let current = entry.layer.drawableSize();
         if current.width != width || current.height != height {
-            let layer_id = entry.layer.as_ref() as *const metal::MetalLayerRef as *mut AnyObject;
-            let _: () = msg_send![layer_id, setDrawableSize: NSSize::new(width, height)];
+            entry.layer.setDrawableSize(NSSize::new(width, height));
         }
         let fade = fade_amount(entry.fade_started);
         if fade.is_none() {
@@ -408,78 +442,81 @@ unsafe fn draw_entry(entry: &mut LiveView, phase: f64) {
             c1: color(1),
             c2: color(2),
         };
-        let (texture_width, texture_height) = (width as u64, height as u64);
+        let (texture_width, texture_height) = (width as usize, height as usize);
         with_renderer(|renderer| {
             let style_pipeline = pipeline(renderer, style)?;
             if !texture_matches(&entry.display, texture_width, texture_height) {
-                entry.display = Some(offscreen_texture(
-                    &renderer.device,
-                    texture_width,
-                    texture_height,
-                ));
+                entry.display = offscreen_texture(&renderer.device, texture_width, texture_height);
             }
             let display = entry.display.clone()?;
             let composite = match fade {
                 Some(_) => Some(pipeline(renderer, "composite")?),
                 None => None,
             };
-            let command_buffer = renderer.queue.new_command_buffer();
-            let draw_style = |target: &metal::TextureRef| -> Option<()> {
-                let encoder = begin_pass(command_buffer, target)?;
-                encoder.set_render_pipeline_state(&style_pipeline);
-                encoder.set_fragment_bytes(
+            let command_buffer = renderer.queue.commandBuffer()?;
+            let draw_style = |target: &ProtocolObject<dyn MTLTexture>| -> Option<()> {
+                let encoder = begin_pass(&command_buffer, target)?;
+                encoder.setRenderPipelineState(&style_pipeline);
+                // SAFETY: The uniforms are copied from a live value into the slot the style's
+                // fragment shader reads them from, and the triangle is generated from the vertex id.
+                encoder.setFragmentBytes_length_atIndex(
+                    NonNull::from(&uniforms).cast(),
+                    std::mem::size_of::<LiveUniforms>(),
                     0,
-                    std::mem::size_of::<LiveUniforms>() as u64,
-                    &uniforms as *const LiveUniforms as *const c_void,
                 );
-                encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
-                encoder.end_encoding();
+                encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+                encoder.endEncoding();
                 Some(())
             };
             match (fade, entry.fading_from.clone(), composite) {
                 (Some(amount), Some(from), Some(composite)) => {
                     if !texture_matches(&entry.style_frame, texture_width, texture_height) {
-                        entry.style_frame = Some(offscreen_texture(
-                            &renderer.device,
-                            texture_width,
-                            texture_height,
-                        ));
+                        entry.style_frame =
+                            offscreen_texture(&renderer.device, texture_width, texture_height);
                     }
                     let style_frame = entry.style_frame.clone()?;
                     draw_style(&style_frame)?;
-                    let encoder = begin_pass(command_buffer, &display)?;
-                    encoder.set_render_pipeline_state(&composite);
-                    encoder.set_fragment_texture(0, Some(&from));
-                    encoder.set_fragment_texture(1, Some(&style_frame));
-                    encoder.set_fragment_bytes(
+                    let encoder = begin_pass(&command_buffer, &display)?;
+                    encoder.setRenderPipelineState(&composite);
+                    // SAFETY: Both textures are retained by Metal for the pass, the amount is
+                    // copied from a live value, and the triangle is generated from the vertex id.
+                    encoder.setFragmentTexture_atIndex(Some(&from), 0);
+                    encoder.setFragmentTexture_atIndex(Some(&style_frame), 1);
+                    encoder.setFragmentBytes_length_atIndex(
+                        NonNull::from(&amount).cast(),
+                        std::mem::size_of::<f32>(),
                         0,
-                        std::mem::size_of::<f32>() as u64,
-                        &amount as *const f32 as *const c_void,
                     );
-                    encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
-                    encoder.end_encoding();
+                    encoder.drawPrimitives_vertexStart_vertexCount(
+                        MTLPrimitiveType::Triangle,
+                        0,
+                        3,
+                    );
+                    encoder.endEncoding();
                 }
                 _ => draw_style(&display)?,
             }
-            let drawable = entry.layer.next_drawable()?;
-            let blit = command_buffer.new_blit_command_encoder();
-            blit.copy_from_texture(
+            let drawable = entry.layer.nextDrawable()?;
+            let blit = command_buffer.blitCommandEncoder()?;
+            // SAFETY: Both textures are BGRA8 and at least `texture_width` x `texture_height`:
+            // the drawable was sized to them above.
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
                 &display,
                 0,
                 0,
-                metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                metal::MTLSize {
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize {
                     width: texture_width,
                     height: texture_height,
                     depth: 1,
                 },
-                drawable.texture(),
+                &drawable.texture(),
                 0,
                 0,
-                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLOrigin { x: 0, y: 0, z: 0 },
             );
-            blit.end_encoding();
-            command_buffer.present_drawable(drawable);
+            blit.endEncoding();
+            command_buffer.presentDrawable(ProtocolObject::from_ref(&*drawable));
             command_buffer.commit();
             Some(())
         });
