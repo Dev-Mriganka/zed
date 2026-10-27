@@ -2048,9 +2048,24 @@ impl Window {
                     .log_err();
             }
         }));
+        // CDXC:DisplayChange 2026-10-27 WHY:
+        // Plugging in or unplugging a monitor on Windows makes code inside an App update call `SetWindowPos`, which sends `WM_MOVE` before it returns; when that lands the window on another monitor the platform reports a display change while App is still borrowed, and `AsyncApp::update` panicked with "RefCell already borrowed", closing the app. Run the update now when App is free, and otherwise defer it to the foreground executor so the window still learns its new display.
         platform_window.on_display_changed(Box::new({
             let cx = cx.to_async();
-            move || cx.update(|cx| Window::display_changed(handle, cx))
+            let foreground_executor = cx.foreground_executor().clone();
+            move || {
+                if cx.try_update(|cx| Window::display_changed(handle, cx)).is_some() {
+                    return;
+                }
+                let cx = cx.clone();
+                foreground_executor
+                    .spawn(async move {
+                        if cx.try_update(|cx| Window::display_changed(handle, cx)).is_none() {
+                            log::error!("display change for {handle:?} dropped: app unavailable");
+                        }
+                    })
+                    .detach();
+            }
         }));
         platform_window.on_appearance_changed(Box::new({
             let cx = cx.to_async();

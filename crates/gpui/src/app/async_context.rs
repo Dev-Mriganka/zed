@@ -179,6 +179,15 @@ impl AsyncApp {
         lock.update(f)
     }
 
+    /// Like [`Self::update`], but returns `None` instead of panicking when the app has been
+    /// released or is already borrowed, as it is when a platform callback runs re-entrantly
+    /// inside another update.
+    pub(crate) fn try_update<R>(&self, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+        let app = self.app.upgrade()?;
+        let mut lock = app.try_borrow_mut().ok()?;
+        Some(lock.update(f))
+    }
+
     /// Arrange for the given callback to be invoked whenever the given entity emits an event of a given type.
     /// The callback is provided a handle to the emitting entity and a reference to the emitted event.
     pub fn subscribe<T, Event>(
