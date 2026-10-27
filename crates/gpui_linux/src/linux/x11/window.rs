@@ -76,7 +76,7 @@ x11rb::atom_manager! {
         _KDE_NET_WM_BLUR_BEHIND_REGION,
         _NET_WM_MOVERESIZE,
         _NET_WM_WINDOW_TYPE,
-        _NET_WM_WINDOW_TYPE_NOTIFICATION,
+        _NET_WM_WINDOW_TYPE_TOOLBAR,
         _NET_WM_WINDOW_TYPE_DIALOG,
         _NET_WM_STATE_MODAL,
         _NET_WM_SYNC,
@@ -674,6 +674,8 @@ impl X11WindowState {
                 )?;
             }
 
+            // CDXC:PlatformSupport 2026-10-28 WHY:
+            // Hyprland gives a click on an override-redirect X11 window to the focused window instead whenever the window's type says it takes no input (NOTIFICATION, TOOLTIP, MENU, POPUP_MENU, DROPDOWN_MENU, COMBO, UTILITY, SPLASH, DND, DESKTOP; `wantsFocus` in its xwayland/XSurface.cpp), so with NOTIFICATION the app modals' close button, toast buttons, chat suggestions and the Docs format bar could not be clicked on Omarchy. TOOLBAR is a floating type outside that list, which Hyprland also maps without giving it focus. The window stays override-redirect, so window managers still leave it unmanaged: no decorations, no taskbar or alt-tab entry, no focus change, placed where the app puts it, as every X11 server already delivered pointer input to it.
             if params.kind == WindowKind::PopUp {
                 check_reply(
                     || "X11 ChangeProperty32 setting window type for pop-up failed.",
@@ -682,7 +684,7 @@ impl X11WindowState {
                         x_window,
                         atoms._NET_WM_WINDOW_TYPE,
                         xproto::AtomEnum::ATOM,
-                        &[atoms._NET_WM_WINDOW_TYPE_NOTIFICATION],
+                        &[atoms._NET_WM_WINDOW_TYPE_TOOLBAR],
                     ),
                 )?;
             }
