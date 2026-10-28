@@ -183,6 +183,29 @@ impl EventSource for XDPEventSource {
     }
 }
 
+/// The desktop's colour scheme read once, waiting at most `timeout`, for the first frame.
+///
+/// CDXC:PlatformSupport 2026-10-28 WHY: the platform started out Light and learned the real scheme
+/// only when the portal listener above answered, about two seconds into the launch on Omarchy, so a
+/// dark desktop saw every window drawn light first and then switch. Reading it before the first
+/// window opens costs one D-Bus round trip; the listener still follows later changes, and a portal
+/// that does not answer in time leaves Light as before.
+pub fn initial_window_appearance(timeout: std::time::Duration) -> Option<WindowAppearance> {
+    let read = async {
+        let settings = Settings::new().await.ok()?;
+        settings
+            .color_scheme()
+            .await
+            .ok()
+            .map(window_appearance_from_color_scheme)
+    };
+    let deadline = async {
+        smol::Timer::after(timeout).await;
+        None
+    };
+    smol::block_on(smol::future::or(read, deadline))
+}
+
 fn window_appearance_from_color_scheme(cs: ColorScheme) -> WindowAppearance {
     match cs {
         ColorScheme::PreferDark => WindowAppearance::Dark,

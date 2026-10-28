@@ -604,6 +604,14 @@ impl X11Client {
             .map_err(|err| anyhow!("Failed to initialize X11 event source: {err:?}"))?;
         self.0.borrow_mut().registrations.push(token);
 
+        // The desktop's colour scheme before the first window opens, so it is not drawn Light first
+        // (`initial_window_appearance`).
+        if let Some(appearance) =
+            crate::linux::xdg_desktop_portal::initial_window_appearance(Duration::from_millis(500))
+        {
+            self.with_common(|common| common.appearance = appearance);
+        }
+
         let token = handle
             .insert_source(XDPEventSource::new(&background_executor), {
                 let this = this.clone();

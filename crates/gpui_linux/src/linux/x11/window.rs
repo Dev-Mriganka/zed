@@ -689,6 +689,26 @@ impl X11WindowState {
                 )?;
             }
 
+            // CDXC:PlatformSupport 2026-10-28 WHY:
+            // A floating window opened without a parent (Ghostex's capture panel, prompt and editor,
+            // Docs note windows) carried no WM_TRANSIENT_FOR and the default NORMAL type, so tiling
+            // window managers (Hyprland on Omarchy) tiled it beside the app. The DIALOG type is the
+            // standard "float this" hint every tiling manager honours; no modal state is set, so the
+            // window still lets the app behind it be used, and a window with a parent keeps the
+            // transient hint below and the type it had.
+            if params.kind == WindowKind::Floating && parent_window.is_none() {
+                check_reply(
+                    || "X11 ChangeProperty32 setting window type for floating window failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_WINDOW_TYPE,
+                        xproto::AtomEnum::ATOM,
+                        &[atoms._NET_WM_WINDOW_TYPE_DIALOG],
+                    ),
+                )?;
+            }
+
             if params.kind == WindowKind::Floating || params.kind == WindowKind::Dialog {
                 if let Some(parent_window) = parent_window.as_ref().map(|w| w.x_window) {
                     // WM_TRANSIENT_FOR hint indicating the main application window. For floating windows, we set
