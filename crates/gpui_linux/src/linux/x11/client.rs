@@ -948,12 +948,8 @@ impl X11Client {
                             state.xdnd_state.other_window,
                         );
                     } else {
-                        if let Some(atom) = [arg2, arg3, arg4]
-                            .into_iter()
-                            .find(|atom| xdnd_is_atom_supported(*atom, &state.atoms))
-                        {
-                            state.xdnd_state.drag_type = atom;
-                        }
+                        state.xdnd_state.drag_type =
+                            xdnd_preferred_atom([arg2, arg3, arg4], &state.atoms);
                     }
                 } else if event.type_ == state.atoms.XdndLeave {
                     let position = state.xdnd_state.position;
@@ -963,12 +959,26 @@ impl X11Client {
                     window.handle_input(PlatformInput::FileDrop(FileDropEvent::Exited {}));
                     self.0.borrow_mut().xdnd_state = Xdnd::default();
                 } else if event.type_ == state.atoms.XdndPosition {
-                    if let Ok(pos) = get_reply(
-                        || "Failed to query pointer position",
-                        state.xcb_connection.query_pointer(event.window),
+                    // The pointer's root position is in the message (XDND: x in the high 16 bits
+                    // of data.l[2], y in the low). Asking the X server where its pointer is went
+                    // wrong under XWayland: for a drag from a Wayland app the compositor drives
+                    // the drag and the X pointer stays where it was, so the drop landed on
+                    // whatever was under that stale point and nothing took it.
+                    let root = state.xcb_connection.setup().roots[state.x_root_index].root;
+                    if let Ok(translated) = get_reply(
+                        || "Failed to translate drag and drop position",
+                        state.xcb_connection.translate_coordinates(
+                            root,
+                            event.window,
+                            (arg2 >> 16) as i16,
+                            (arg2 & 0xffff) as i16,
+                        ),
                     ) {
-                        state.xdnd_state.position =
-                            Point::new(px(pos.win_x as f32), px(pos.win_y as f32));
+                        // Device pixels, like the pointer events above, which divide the same way.
+                        state.xdnd_state.position = Point::new(
+                            px(translated.dst_x as f32 / state.scale_factor),
+                            px(translated.dst_y as f32 / state.scale_factor),
+                        );
                     }
                     if !state.xdnd_state.retrieved {
                         check_reply(
@@ -988,7 +998,6 @@ impl X11Client {
                         &state.atoms,
                         event.window,
                         state.xdnd_state.other_window,
-                        arg4,
                     );
                     let position = state.xdnd_state.position;
                     drop(state);
@@ -1019,7 +1028,8 @@ impl X11Client {
                         state.atoms.XDND_DATA,
                         AtomEnum::ANY,
                         0,
-                        1024,
+                        // In 32-bit units: room for thousands of paths, where 1024 cut a drop at 4 KB.
+                        XDND_DATA_MAX_LONGS,
                     ),
                 )
                 .log_err();
@@ -1027,17 +1037,7 @@ impl X11Client {
                     return Some(());
                 };
                 if let Ok(file_list) = str::from_utf8(&reply.value) {
-                    let paths: SmallVec<[_; 2]> = file_list
-                        .lines()
-                        .filter_map(|path| Url::parse(path).log_err())
-                        .filter_map(|url| match url.to_file_path() {
-                            Ok(url) => Some(url),
-                            Err(()) => {
-                                log::error!("Failed turn {url:?} into a file path");
-                                None
-                            }
-                        })
-                        .collect();
+                    let paths = xdnd_dropped_paths(file_list);
                     let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                         position: state.xdnd_state.position,
                         paths: gpui::ExternalPaths(paths),
@@ -2460,13 +2460,55 @@ fn check_gtk_frame_extents_supported(
     supported_atom_ids.contains(&atoms._GTK_FRAME_EXTENTS)
 }
 
-fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {
-    atom == atoms.TEXT
-        || atom == atoms.STRING
-        || atom == atoms.UTF8_STRING
-        || atom == atoms.TEXT_PLAIN
-        || atom == atoms.TEXT_PLAIN_UTF8
-        || atom == atoms.TextUriList
+const XDND_DATA_MAX_LONGS: u32 = 1 << 20;
+
+/// The drag types GPUI reads, best first: `text/uri-list` names files exactly, the text types
+/// only by convention.
+fn xdnd_supported_atoms_by_preference(atoms: &XcbAtoms) -> [u32; 6] {
+    [
+        atoms.TextUriList,
+        atoms.TEXT_PLAIN_UTF8,
+        atoms.UTF8_STRING,
+        atoms.TEXT_PLAIN,
+        atoms.STRING,
+        atoms.TEXT,
+    ]
+}
+
+/// The type to ask the source for, by GPUI's preference rather than the source's order: file
+/// managers (Nautilus) list a plain-text type before `text/uri-list`, and asking for that one
+/// returned bare paths that no longer parsed as URLs, so every drop came in empty.
+fn xdnd_preferred_atom(offered: impl IntoIterator<Item = u32>, atoms: &XcbAtoms) -> u32 {
+    let offered: SmallVec<[u32; 8]> = offered.into_iter().collect();
+    xdnd_supported_atoms_by_preference(atoms)
+        .into_iter()
+        .find(|atom| *atom != 0 && offered.contains(atom))
+        .unwrap_or(0)
+}
+
+/// The files a drop names: `file://` URIs (`text/uri-list`, comments skipped) or, from a source
+/// that only offers text, absolute paths one per line.
+fn xdnd_dropped_paths(file_list: &str) -> SmallVec<[PathBuf; 2]> {
+    file_list
+        .lines()
+        .map(|line| {
+            line.trim_matches(|character: char| character.is_whitespace() || character == '\0')
+        })
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            if line.starts_with('/') {
+                return Some(PathBuf::from(line));
+            }
+            let url = Url::parse(line).log_err()?;
+            match url.to_file_path() {
+                Ok(path) => Some(path),
+                Err(()) => {
+                    log::error!("Failed turn {url:?} into a file path");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 fn xdnd_get_supported_atom(
@@ -2488,11 +2530,7 @@ fn xdnd_get_supported_atom(
     .log_with_level(Level::Warn)
         && let Some(atoms) = reply.value32()
     {
-        for atom in atoms {
-            if xdnd_is_atom_supported(atom, supported_atoms) {
-                return atom;
-            }
-        }
+        return xdnd_preferred_atom(atoms, supported_atoms);
     }
     0
 }
@@ -2519,18 +2557,20 @@ fn xdnd_send_finished(
     xcb_connection.flush().log_err();
 }
 
+/// Accepts the drop as a copy whatever the source proposed: answering with its own action could
+/// tell a file manager that Shift-dragged a file to move it, and the source then deletes the
+/// original. XdndFinished reports the same copy.
 fn xdnd_send_status(
     xcb_connection: &XCBConnection,
     atoms: &XcbAtoms,
     source: xproto::Window,
     target: xproto::Window,
-    action: u32,
 ) {
     let message = ClientMessageEvent {
         format: 32,
         window: target,
         type_: atoms.XdndStatus,
-        data: ClientMessageData::from([source, 1, 0, 0, action]),
+        data: ClientMessageData::from([source, 1, 0, 0, atoms.XdndActionCopy]),
         sequence: 0,
         response_type: xproto::CLIENT_MESSAGE_EVENT,
     };
@@ -2990,6 +3030,24 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xdnd_drops_name_files_as_uris_or_plain_paths() {
+        let uri_list = "file:///home/u/My%20File.txt\r\n# comment\r\nfile:///tmp/b.png\r\n\0";
+        assert_eq!(
+            xdnd_dropped_paths(uri_list).into_vec(),
+            vec![
+                PathBuf::from("/home/u/My File.txt"),
+                PathBuf::from("/tmp/b.png")
+            ]
+        );
+        // Nautilus's plain-text flavor: bare absolute paths.
+        assert_eq!(
+            xdnd_dropped_paths("/home/u/dnd/dnd-test.txt\n").into_vec(),
+            vec![PathBuf::from("/home/u/dnd/dnd-test.txt")]
+        );
+        assert!(xdnd_dropped_paths("just some text").is_empty());
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")
